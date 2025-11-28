@@ -1,261 +1,243 @@
-###############################################
-## 1. 加载包
-###############################################
-library(tidyverse)
-library(lubridate)
-library(mgcv)
+# ============================================
+# 一次性完整脚本：在 Colab 里新建一个 cell 粘贴运行
+# ============================================
 
-###############################################
-## 2. 读入并合并所有 CSV
-##   假设 CSV 文件放在当前工作目录
-##   例如: "M377_merged.csv", "M379_merged.csv", ...
-###############################################
+# 0. 安装依赖
+!pip install -q pygam
 
-# 如果你在 Rstudio 里, 可以 setwd("你的目录")，这里就省略了
-file_list <- c("M377_merged.csv",
-               "M379_merged.csv",
-               "M380_merged.csv",
-               "M382_merged.csv",
-               "M383_merged.csv")
+# 1. 导入包
+import pandas as pd
+import numpy as np
+from math import pi
+from pygam import LogisticGAM, s
+import matplotlib.pyplot as plt
 
-raw_list <- lapply(file_list, read.csv, stringsAsFactors = FALSE)
-dat_raw  <- bind_rows(raw_list)
+# ------------------------------------------------
+# 2. 读入并合并 5 个 CSV
+# ------------------------------------------------
+file_list = [
+    "M377_merged.csv",
+    "M379_merged.csv",
+    "M380_merged.csv",
+    "M382_merged.csv",
+    "M383_merged.csv",
+]
 
-###############################################
-## 3. 基本预处理 & 改列名
-###############################################
+dfs = [pd.read_csv(f) for f in file_list]
+df = pd.concat(dfs, ignore_index=True)
 
-dat <- dat_raw %>%
-  # 改几个名字方便写公式（原列名里有空格/括号）
-  rename(
-    Ta       = `Ta(ambient_temp)`,
-    cum_food = `Cumulative_Food_intake (g0`
-  ) %>%
-  # 转时间格式
-  mutate(
-    date_time_corrected = ymd_hms(date_time_corrected),
-    # 提取小时 (0–24) 做 time-of-day
-    tod = hour(date_time_corrected) + minute(date_time_corrected) / 60
-  ) %>%
-  # 把 Phase / Sleep 之类转成因子
-  mutate(
-    Phase_lbl = factor(Phase_lbl),
-    Sleep     = factor(Sleep),
-    MouseID   = factor(MouseID)
-  )
+print("合并后的数据形状:", df.shape)
+print("原始列名：")
+print(df.columns.tolist())
+print("-" * 60)
 
-###############################################
-## 4. (示例) 定义 torpor 变量 —— 必须按你自己的标准改 !!!
-###############################################
-## 这里只是一个非常粗糙的例子：
-## 假设 torpor 时 Tb 下降 + 代谢 (TEE) 很低
-## 你需要根据生理标准改阈值/规则 !!!
+# ------------------------------------------------
+# 3. 重命名列 + 时间处理 + 类别变量
+# ------------------------------------------------
 
-dat <- dat %>%
-  group_by(MouseID) %>%
-  mutate(
-    # 下面是示例：Tb < 32°C 且 TEE 在该鼠的后10%分位以下
-    # TODO: 按你自己的 torpor 判定标准修改这一行！！！
-    torpor = if_else(
-      Tb_dsi < 32 &
-        TEE <= quantile(TEE, 0.10, na.rm = TRUE),
-      1L, 0L
-    )
-  ) %>%
-  ungroup()
+# 3.1 重命名 Ta
+if "Ta(ambient_temp)" in df.columns:
+    df = df.rename(columns={"Ta(ambient_temp)": "Ta"})
+elif "Ta" not in df.columns:
+    raise ValueError("找不到环境温度列，请检查是否有 'Ta(ambient_temp)' 或 'Ta'。")
 
-# 只保留需要的变量并去掉 NA
-dat <- dat %>%
-  select(
-    torpor, MouseID, date_time_corrected,
-    Ta, cum_food, tod, age, BW_start, BW_end,
-    TEE, VO2, Phase_lbl, Tb_dsi, Activity_dsi, Sleep, Wake
-  ) %>%
-  drop_na(torpor, Ta, cum_food, tod, age, BW_start)
+# 3.2 找到累积进食列，重命名为 cum_food
+if "cum_food" not in df.columns:
+    candidates = [c for c in df.columns if "Cumulative_Food" in c or "cum_food" in c]
+    if len(candidates) == 0:
+        raise ValueError("找不到累积进食列（包含 'Cumulative_Food' 或 'cum_food' 的列），请检查列名。")
+    print("检测到累积进食列，将其重命名为 'cum_food'：", candidates[0])
+    df = df.rename(columns={candidates[0]: "cum_food"})
 
-###############################################
-## 5. 构建 time-of-day 的周期变量 & 标准化线性变量
-###############################################
+# 3.3 时间处理
+if "date_time_corrected" not in df.columns:
+    raise ValueError("找不到 'date_time_corrected' 列，请检查列名。")
 
-dat <- dat %>%
-  mutate(
-    # 转成 0~2π 的角度，做周期平滑
-    tod_rad = tod / 24 * 2 * pi,
-    # 标准化年龄和体重，方便比较效应大小
-    age_z      = as.numeric(scale(age)),
-    BW_start_z = as.numeric(scale(BW_start))
-  )
+df["date_time_corrected"] = pd.to_datetime(df["date_time_corrected"])
+df["tod"] = df["date_time_corrected"].dt.hour + df["date_time_corrected"].dt.minute / 60.0
 
-###############################################
-## 6. 建立 "全模型" GAMM
-##    - torpor 为 0/1 (二项分布 + logit link)
-##    - Ta / cum_food / tod_rad 非线性平滑
-##    - age_z, BW_start_z 线性
-##    - (1 | MouseID) 随机截距
-###############################################
+# 3.4 转成类别类型（如果存在）
+for col in ["Phase_lbl", "Sleep", "Wake", "MouseID", "Cage"]:
+    if col in df.columns:
+        df[col] = df[col].astype("category")
 
-# 注意: bs="cc" 是周期平滑，需要指定 knots
-knots_list <- list(tod_rad = c(0, 2 * pi))
+print("重命名后列名：")
+print(df.columns.tolist())
+print("-" * 60)
 
-m_full <- gamm(
-  torpor ~
-    s(Ta,       k = 5) +             # Ta 非线性
-    s(cum_food, k = 5) +             # 累积进食非线性
-    s(tod_rad,  bs = "cc", k = 6) +  # 时间-of-day 的周期非线性
-    age_z + BW_start_z,              # 年龄、体重线性
-  random = list(MouseID = ~ 1),
-  family = binomial,
-  data   = dat,
-  knots  = knots_list
-)
+# ------------------------------------------------
+# 4. 定义 torpor（二元变量）—— 示例规则
+#    ⚠️ 以后可以在这里换成自己的判定标准
+# ------------------------------------------------
+required_for_torpor = ["Tb_dsi", "TEE", "MouseID"]
+for col in required_for_torpor:
+    if col not in df.columns:
+        raise ValueError(f"定义 torpor 需要列 {col}，但数据中没有，请检查。")
 
-# 看一下平滑项信息
-summary(m_full$gam)
-# 画出平滑曲线 (f(Ta), f(cum_food), f(tod_rad))
-plot(m_full$gam, pages = 1, shade = TRUE)
+# 对每只鼠计算 TEE 的 10% 分位数
+q10 = df.groupby("MouseID")["TEE"].transform(lambda x: x.quantile(0.10))
 
-###############################################
-## 7. 用 "删掉一个变量" 比较 ΔAIC → 重要性排序
-###############################################
+# 示例规则：Tb_dsi < 32 且 TEE <= 自身10%分位数 -> torpor = 1
+# TODO：以后你可以把这一行改成你自己的判定规则
+df["torpor"] = np.where(
+    (df["Tb_dsi"] < 32) & (df["TEE"] <= q10),
+    1,
+    0
+).astype(int)
 
-# 去掉 Ta
-m_noTa <- gamm(
-  torpor ~
-    s(cum_food, k = 5) +
-    s(tod_rad,  bs = "cc", k = 6) +
-    age_z + BW_start_z,
-  random = list(MouseID = ~ 1),
-  family = binomial,
-  data   = dat,
-  knots  = knots_list
-)
+print("torpor=1 的比例:", df["torpor"].mean())
+print("-" * 60)
 
-# 去掉 cum_food
-m_noFood <- gamm(
-  torpor ~
-    s(Ta, k = 5) +
-    s(tod_rad, bs = "cc", k = 6) +
-    age_z + BW_start_z,
-  random = list(MouseID = ~ 1),
-  family = binomial,
-  data   = dat,
-  knots  = knots_list
-)
+# ------------------------------------------------
+# 5. 选择变量、去 NA、构造特征
+# ------------------------------------------------
+needed_cols = [
+    "torpor", "MouseID", "date_time_corrected",
+    "Ta", "cum_food", "tod",
+    "age", "BW_start", "BW_end",
+    "TEE", "VO2",
+    "Phase_lbl", "Tb_dsi", "Activity_dsi", "Sleep", "Wake"
+]
 
-# 去掉 tod_rad (时间-of-day)
-m_noTod <- gamm(
-  torpor ~
-    s(Ta, k = 5) +
-    s(cum_food, k = 5) +
-    age_z + BW_start_z,
-  random = list(MouseID = ~ 1),
-  family = binomial,
-  data   = dat
-)
+cols_existing = [c for c in needed_cols if c in df.columns]
+df = df[cols_existing].copy()
+print("用于分析的数据列：", df.columns.tolist())
 
-# 去掉 age_z
-m_noAge <- gamm(
-  torpor ~
-    s(Ta, k = 5) +
-    s(cum_food, k = 5) +
-    s(tod_rad, bs = "cc", k = 6) +
-    BW_start_z,
-  random = list(MouseID = ~ 1),
-  family = binomial,
-  data   = dat,
-  knots  = knots_list
-)
+# 去掉关键变量缺失的行
+for col in ["torpor", "Ta", "cum_food", "tod", "age", "BW_start"]:
+    if col not in df.columns:
+        raise ValueError(f"分析需要列 {col}，请检查数据。")
+    df = df[df[col].notna()]
 
-# 去掉 BW_start_z
-m_noBW <- gamm(
-  torpor ~
-    s(Ta, k = 5) +
-    s(cum_food, k = 5) +
-    s(tod_rad, bs = "cc", k = 6) +
-    age_z,
-  random = list(MouseID = ~ 1),
-  family = binomial,
-  data   = dat,
-  knots  = knots_list
-)
+print("去掉 NA 后数据形状:", df.shape)
 
-# 汇总 AIC (注意用 $lme)
-aic_tab <- AIC(
-  full   = m_full$lme,
-  noTa   = m_noTa$lme,
-  noFood = m_noFood$lme,
-  noTod  = m_noTod$lme,
-  noAge  = m_noAge$lme,
-  noBW   = m_noBW$lme
-) %>%
-  as.data.frame() %>%
-  rownames_to_column("model") %>%
-  arrange(AIC) %>%
-  mutate(delta_AIC = AIC - min(AIC))
+# 构造 time-of-day 的周期特征
+df["tod_rad"] = df["tod"] / 24.0 * 2 * pi
 
-print(aic_tab)
+# 标准化年龄和体重（注意 std=0 的情况）
+age_std = df["age"].std()
+if age_std == 0 or np.isnan(age_std):
+    print("警告：age 标准差为 0，视为常数变量，age_z 全部设为 0。")
+    df["age_z"] = 0.0
+else:
+    df["age_z"] = (df["age"] - df["age"].mean()) / age_std
 
-## 解读：
-## - 行数最上面 AIC 最小的是“最好”的模型
-## - 某个变量被删掉后，delta_AIC 越大 -> 这个变量对模型贡献越大 -> 越重要
+bw_std = df["BW_start"].std()
+if bw_std == 0 or np.isnan(bw_std):
+    print("警告：BW_start 标准差为 0，视为常数变量，BW_start_z 全部设为 0。")
+    df["BW_start_z"] = 0.0
+else:
+    df["BW_start_z"] = (df["BW_start"] - df["BW_start"].mean()) / bw_std
 
-###############################################
-## 8. 用 "Δp" 衡量每个因素把 torpor 概率推多远
-###############################################
+feature_cols = ["Ta", "cum_food", "tod_rad", "age_z", "BW_start_z"]
 
-## 帮你写一个函数：固定其他变量在均值，
-## 只让某一个变量在观测范围内变化，
-## 看 torpor 概率的最大/最小值差 Δp
+# 把 Inf 换成 NaN 再统一丢掉
+df = df.replace([np.inf, -np.inf], np.nan)
+df = df.dropna(subset=feature_cols + ["torpor"])
 
-effect_delta_p <- function(var_name, n_grid = 100) {
-  # 取各变量的典型值（均值）
-  base <- dat %>%
-    summarise(
-      Ta       = mean(Ta,       na.rm = TRUE),
-      cum_food = mean(cum_food, na.rm = TRUE),
-      tod_rad  = mean(tod_rad,  na.rm = TRUE),
-      age_z      = mean(age_z,      na.rm = TRUE),
-      BW_start_z = mean(BW_start_z, na.rm = TRUE)
-    )
+X = df[feature_cols].values
+y = df["torpor"].values
 
-  # 该变量的范围（这里用 10% ~ 90% 分位数避免极端值）
-  q <- quantile(dat[[var_name]], probs = c(0.1, 0.9), na.rm = TRUE)
-  grid_vals <- seq(q[1], q[2], length.out = n_grid)
+print("特征列：", feature_cols)
+print("X 形状:", X.shape, "y 形状:", y.shape)
+print("X 中是否有 NaN：", np.isnan(X).any())
+print("-" * 60)
 
-  # 构造 newdata，只改变 var_name，其它用 base 值
-  newdat <- base[rep(1, n_grid), ]
-  newdat[[var_name]] <- grid_vals
-  # MouseID 写 NA，让预测用 population-level
-  newdat$MouseID <- NA
+# ------------------------------------------------
+# 6. 拟合非线性 Logistic GAM（全模型）
+# ------------------------------------------------
+gam_full = LogisticGAM(
+    s(0) + s(1) + s(2) + s(3) + s(4)
+).fit(X, y)
 
-  # 预测概率
-  p <- predict(m_full$gam, newdata = newdat, type = "response")
-  c(
-    var   = var_name,
-    p_min = min(p),
-    p_max = max(p),
-    delta_p = max(p) - min(p)
-  )
-}
+print("全模型 AIC:", gam_full.statistics_["AIC"])
+print(gam_full.summary())
+print("-" * 60)
 
-# 对 Ta / cum_food / tod_rad 各算一遍
-dp_Ta      <- effect_delta_p("Ta")
-dp_food    <- effect_delta_p("cum_food")
-dp_tod_rad <- effect_delta_p("tod_rad")
+# 如需查看每个变量的非线性曲线，可解开下面注释：
+# for i, name in enumerate(feature_cols):
+#     XX = gam_full.generate_X_grid(term=i)
+#     plt.figure()
+#     plt.plot(XX[:, i], gam_full.partial_dependence(term=i, X=XX))
+#     plt.xlabel(name)
+#     plt.ylabel(f"f({name})")
+#     plt.title(f"Partial effect of {name}")
+#     plt.show()
 
-delta_p_tab <- rbind(dp_Ta, dp_food, dp_tod_rad) %>%
-  as.data.frame()
+# ------------------------------------------------
+# 7. 删掉一个变量，比较 AIC（ΔAIC 用来看重要性）
+# ------------------------------------------------
+def fit_gam_on_features(cols):
+    """
+    给定要用的列名，拟合一个 GAM 并返回模型
+    注意：这里的 X_sub 维度 = len(cols)，所以要重新构造 s(0)+s(1)+...
+    """
+    X_sub = df[cols].values
+    n_feats = X_sub.shape[1]
 
-print(delta_p_tab)
+    # 构造 term 列表：s(0) + s(1) + ... + s(n_feats-1)
+    if n_feats == 1:
+        terms = s(0)
+    else:
+        terms = s(0)
+        for j in range(1, n_feats):
+            terms = terms + s(j)
 
-## 解读：
-## - 对每个变量，在其常见范围(10%~90%分位)内变化时，
-##   torpor 概率从 p_min 到 p_max，
-##   差值 delta_p 越大 -> 说明这个变量在生理上“能把 torpor 概率推得更厉害” -> 越重要
+    model = LogisticGAM(terms).fit(X_sub, y)
+    return model
 
-###############################################
-## 9. 你可以在这里添加更多变量/修改模型：
-##   - 比如加 Activity_dsi 的平滑: s(Activity_dsi)
-##   - 或加 Phase_lbl, Sleep 作为因子
-##   然后重复 7/8 步骤比较重要性
-###############################################
+results_aic = []
+
+for drop_col in feature_cols:
+    cols = [c for c in feature_cols if c != drop_col]
+    gam_sub = fit_gam_on_features(cols)
+    aic_sub = gam_sub.statistics_["AIC"]
+    results_aic.append({"dropped": drop_col, "AIC": aic_sub})
+
+aic_df = pd.DataFrame(results_aic)
+aic_df["AIC_full"] = gam_full.statistics_["AIC"]
+aic_df["delta_AIC"] = aic_df["AIC"] - aic_df["AIC_full"]
+
+print("删掉每个变量后的 AIC 对比（按 delta_AIC 排序）：")
+print(aic_df.sort_values("delta_AIC"))
+print("-" * 60)
+
+# ------------------------------------------------
+# 8. 计算每个变量的 Δp（在合理范围内能把 torpor 概率推多远）
+# ------------------------------------------------
+def delta_p_for_variable(var_name, n_grid=100):
+    """
+    固定其他变量在均值，
+    只让 var_name 在 10%~90% 分位数范围内变化，
+    用 full GAM 预测 torpor 概率，
+    返回 p_min, p_max, delta_p
+    """
+    base = df[feature_cols].mean()
+
+    q10, q90 = df[var_name].quantile([0.1, 0.9])
+    grid = np.linspace(q10, q90, n_grid)
+
+    rows = []
+    for val in grid:
+        row = base.copy()
+        row[var_name] = val
+        rows.append(row)
+
+    X_grid = np.vstack(rows)
+    p = gam_full.predict_proba(X_grid)
+
+    return {
+        "var": var_name,
+        "p_min": float(p.min()),
+        "p_max": float(p.max()),
+        "delta_p": float(p.max() - p.min())
+    }
+
+delta_p_list = [delta_p_for_variable(v) for v in feature_cols]
+delta_p_df = pd.DataFrame(delta_p_list)
+
+print("各变量 Δp（在常见范围内对 torpor 概率的影响幅度，按 delta_p 排序）：")
+print(delta_p_df.sort_values("delta_p", ascending=False))
+print("-" * 60)
+
+print("✅ 全部计算完成：现在可以根据 delta_AIC 和 delta_p 来比较各因素的重要性。")
