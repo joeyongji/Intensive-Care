@@ -13,14 +13,14 @@ def load_mouse(file_path):
     df = pd.read_excel(file_path)
     # Clean
     df = df[df["Sleep"] != "X"] if "Sleep" in df.columns else df
-    numeric = ["TEE", "Tb_dsi", "Activity_dsi", "Food_intake",
+    numeric = ["VO2", "Tb_dsi", "Activity_dsi", "Food_intake",
                "Ta(ambient_temp)", "age", "BW_start", "BW_end"]
     for col in numeric:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     # body weight combined
     df["BW_mean"] = (df["BW_start"] + df["BW_end"]) / 2
-    df = df.dropna(subset=["TEE", "Tb_dsi", "Activity_dsi"])
+    df = df.dropna(subset=["VO2", "Tb_dsi", "Activity_dsi"])
     return df
 
 # Load
@@ -35,7 +35,7 @@ features = [
     "Wake",
     "BW_mean"
 ]
-target = "TEE"
+target = "VO2"  # Changed from TEE to VO2
 
 X_train = df_train[features]
 y_train = df_train[target]
@@ -81,7 +81,7 @@ colors = plt.cm.RdYlBu_r(np.linspace(0.3, 0.9, len(means)))
 
 # Create horizontal bars with error bars
 y_pos = np.arange(len(means))
-ax.barh(y_pos, means, xerr=stds, 
+ax.barh(y_pos, means, xerr=stds,
         color=colors, edgecolor='#2c3e50', linewidth=1.2,
         error_kw={'linewidth': 2, 'ecolor': '#34495e', 'capsize': 4})
 
@@ -90,8 +90,8 @@ ax.set_yticks(y_pos)
 ax.set_yticklabels(np.array(features)[sorted_idx], fontsize=12)
 
 # Labels and title
-ax.set_xlabel('Mean Decrease in R² ± Std Dev', fontsize=13, fontweight='bold')
-ax.set_title('Permutation Feature Importance (Test Set)', 
+ax.set_xlabel('Mean Decrease in Model Performance (R²) ± Std Dev', fontsize=13, fontweight='bold')
+ax.set_title('Permutation Feature Importance for VO2 Prediction (Test Set)',
              fontsize=14, fontweight='bold', pad=15)
 
 # Add vertical line at zero
