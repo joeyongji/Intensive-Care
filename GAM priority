@@ -1,0 +1,490 @@
+# ============================================
+# Robust feature priority ranking for torpor
+# - Two rankings:
+#   A) within US+ only  (recommended)
+#   B) all samples with group+sex adjusted
+# - Uses:
+#   1) Univariate AUC + bootstrap CI
+#   2) Elastic-net logistic regression + repeated CV permutation importance
+#   3) Selection frequency (stability)
+# ============================================
+
+!pip install -q pygam openpyxl scikit-learn
+
+import pandas as pd
+import numpy as np
+from math import isfinite
+from sklearn.model_selection import RepeatedStratifiedKFold, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+from sklearn.inspection import permutation_importance
+
+# ------------------------------------------------
+import os, glob
+
+# 你上传到 Colab 后通常在 /content/
+CANDIDATES = [
+    "/content/lots of data.xlsx",
+    "/content/Lots of data.xlsx",
+    "/content/lots_of_data.xlsx",
+]
+
+# 自动在 /content 下找任意 xlsx
+auto = glob.glob("/content/*.xlsx")
+CANDIDATES += auto
+
+FILENAME = None
+for p in CANDIDATES:
+    if os.path.exists(p):
+        FILENAME = p
+        break
+
+if FILENAME is None:
+    print("❌ 没找到 Excel。当前 /content 下的文件有：")
+    print(os.listdir("/content"))
+    raise FileNotFoundError("请确认你已把 xlsx 上传到 Colab（左侧 Files 面板 -> Upload）。")
+else:
+    print("✅ Using file:", FILENAME)
+
+
+# ------------------------------------------------
+# 2) Torpor definition (edit if needed)
+# ------------------------------------------------
+TORPOR_TCORE_THRESHOLD = 33.0
+TORPOR_MIN_MINUTES_BELOW = 10.0
+BASELINE_MAX_TIME_MIN = 5.0
+
+# ------------------------------------------------
+# 3) Feature sheets & statistics
+# ------------------------------------------------
+FEATURE_SHEETS = {
+    "VO2": "vo2",
+    "Respiratory Quotient": "rq",
+    "Activity": "act",
+}
+USE_STATS = ["baseline", "delta_min", "mean"]  # predictors
+
+# ------------------------------------------------
+# 4) Parsing helpers (same idea as before)
+# ------------------------------------------------
+def read_sheet_raw(sheet_name):
+    return pd.read_excel(FILENAME, sheet_name=sheet_name, header=None)
+
+def parse_grouped_timeseries_sheet(sheet_name):
+    df = read_sheet_raw(sheet_name)
+    group_row = df.iloc[0]
+    sex_row = df.iloc[1] if df.shape[0] > 1 else pd.Series([np.nan] * df.shape[1])
+    time_col = 0
+
+    cols_by_group = {}
+    for j in range(1, df.shape[1]):
+        if pd.notna(group_row[j]):
+            grp = str(group_row[j]).strip()
+            cols_by_group.setdefault(grp, []).append(j)
+    return df, cols_by_group, sex_row, time_col
+
+def summarize_timeseries(df, time_col, value_col, baseline_max_time=5.0):
+    time = pd.to_numeric(df.iloc[2:, time_col], errors="coerce").astype(float).values
+    vals = pd.to_numeric(df.iloc[2:, value_col], errors="coerce").astype(float).values
+
+    m_base = (time <= baseline_max_time)
+    baseline = np.nanmean(vals[m_base]) if np.any(m_base) else np.nan
+    vmin = np.nanmin(vals)
+    mean = np.nanmean(vals)
+    delta_min = vmin - baseline
+
+    return {
+        "baseline": float(baseline) if np.isfinite(baseline) else np.nan,
+        "vmin": float(vmin) if np.isfinite(vmin) else np.nan,
+        "mean": float(mean) if np.isfinite(mean) else np.nan,
+        "delta_min": float(delta_min) if np.isfinite(delta_min) else np.nan,
+    }
+
+def torpor_from_tcore(tcore_df, tcore_col, thr, min_minutes, baseline_max_time=5.0):
+    time = pd.to_numeric(tcore_df.iloc[2:, 0], errors="coerce").astype(float).values
+    vals = pd.to_numeric(tcore_df.iloc[2:, tcore_col], errors="coerce").astype(float).values
+
+    dt = np.nanmedian(np.diff(time))
+    if not np.isfinite(dt) or dt <= 0:
+        dt = 1.0
+
+    below = vals < thr
+    time_below = float(np.nansum(below) * dt)
+    vmin = np.nanmin(vals)
+    torpor = int((vmin < thr) and (time_below >= min_minutes))
+    return torpor
+
+def build_subject_table_from_tcore():
+    tcore_df, tcore_cols_by_group, sex_row, time_col = parse_grouped_timeseries_sheet("Tcore")
+
+    rows = []
+    group_counts = {}
+    for grp, cols in tcore_cols_by_group.items():
+        group_counts[grp] = len(cols)
+        for idx, col in enumerate(cols, start=1):
+            sid = f"{grp}|{idx:02d}"
+            sex = sex_row[col] if pd.notna(sex_row[col]) else np.nan
+            rows.append({
+                "subject_id": sid,
+                "group": grp,
+                "idx_in_group": idx,
+                "sex": sex,
+                "_tcore_col": col
+            })
+
+    subjects = pd.DataFrame(rows)
+    return subjects, tcore_df, group_counts, time_col
+
+def build_feature_table_from_sheet(sheet_name, prefix, subjects, group_counts, baseline_max_time=5.0):
+    df, cols_by_group, _, time_col = parse_grouped_timeseries_sheet(sheet_name)
+
+    feature_map = {}
+    for grp, n_need in group_counts.items():
+        cols = cols_by_group.get(grp, [])
+        if len(cols) == 0:
+            continue
+        cols_take = cols[:min(len(cols), n_need)]
+        for idx, col in enumerate(cols_take, start=1):
+            sid = f"{grp}|{idx:02d}"
+            feature_map[sid] = summarize_timeseries(df, time_col, col, baseline_max_time=baseline_max_time)
+
+    rows = []
+    for sid in subjects["subject_id"].tolist():
+        stats = feature_map.get(sid, {})
+        row = {"subject_id": sid}
+        for k, v in stats.items():
+            row[f"{prefix}_{k}"] = v
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+# ------------------------------------------------
+# 5) Build master table
+# ------------------------------------------------
+subjects, tcore_df, group_counts, _ = build_subject_table_from_tcore()
+
+subjects["torpor"] = subjects["_tcore_col"].apply(
+    lambda c: torpor_from_tcore(
+        tcore_df, int(c),
+        thr=TORPOR_TCORE_THRESHOLD,
+        min_minutes=TORPOR_MIN_MINUTES_BELOW,
+        baseline_max_time=BASELINE_MAX_TIME_MIN
+    )
+)
+
+master = subjects[["subject_id", "group", "sex", "torpor"]].copy()
+for sh, pref in FEATURE_SHEETS.items():
+    feat_df = build_feature_table_from_sheet(sh, pref, subjects, group_counts, baseline_max_time=BASELINE_MAX_TIME_MIN)
+    master = master.merge(feat_df, on="subject_id", how="left")
+
+master["group"] = master["group"].astype("category")
+master["sex"] = master["sex"].astype("category")
+
+# predictor columns
+cont_cols = []
+for pref in FEATURE_SHEETS.values():
+    for st in USE_STATS:
+        col = f"{pref}_{st}"
+        if col in master.columns:
+            cont_cols.append(col)
+
+print("Group counts:", group_counts)
+print("Overall torpor rate:", master["torpor"].mean())
+print("Torpor rate by group:")
+print(master.groupby("group")["torpor"].mean())
+print("Continuous predictors:", cont_cols)
+print("-" * 60)
+
+# ------------------------------------------------
+# 6) Robust ranking functions
+# ------------------------------------------------
+def bootstrap_auc(x, y, n_boot=2000, seed=0):
+    """
+    Univariate AUC with bootstrap CI.
+    Returns: auc (direction-free), ci_low, ci_high
+    """
+    rng = np.random.default_rng(seed)
+    x = np.asarray(x).reshape(-1)
+    y = np.asarray(y).astype(int)
+
+    # If constant x or single-class y, return NaN
+    if np.nanstd(x) == 0 or len(np.unique(y)) < 2:
+        return np.nan, np.nan, np.nan
+
+    # AUC direction-free: max(auc, 1-auc)
+    try:
+        auc0 = roc_auc_score(y, x)
+        auc0 = max(auc0, 1 - auc0)
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+    aucs = []
+    n = len(y)
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, size=n)
+        xb, yb = x[idx], y[idx]
+        if len(np.unique(yb)) < 2 or np.nanstd(xb) == 0:
+            continue
+        try:
+            a = roc_auc_score(yb, xb)
+            aucs.append(max(a, 1 - a))
+        except Exception:
+            continue
+
+    if len(aucs) < 200:
+        return auc0, np.nan, np.nan
+
+    lo, hi = np.quantile(aucs, [0.025, 0.975])
+    return float(auc0), float(lo), float(hi)
+
+def cv_perm_importance_ranking(df, y_col, feature_cols, add_covariates=None,
+                               n_splits=4, n_repeats=100, seed=0):
+    """
+    Elastic-net logistic + repeated stratified CV
+    output:
+      - perm_importance_mean, perm_importance_ci
+      - selection_freq (coef != 0 frequency)
+    """
+    add_covariates = add_covariates or []
+
+    data = df[[y_col] + add_covariates + feature_cols].copy()
+    data = data.replace([np.inf, -np.inf], np.nan).dropna()
+    y = data[y_col].astype(int).values
+
+    if len(np.unique(y)) < 2:
+        raise ValueError("Only one class in y after filtering; cannot rank.")
+
+    # build X: covariates + features
+    X_parts = []
+    cov_names = []
+
+    # covariates: handle categorical -> codes
+    for c in add_covariates:
+        if str(data[c].dtype) == "category":
+            X_parts.append(data[c].cat.codes.values.reshape(-1, 1))
+        else:
+            X_parts.append(pd.to_numeric(data[c], errors="coerce").values.reshape(-1, 1))
+        cov_names.append(c)
+
+    X_feat = data[feature_cols].astype(float).values
+    X = np.hstack(X_parts + [X_feat]) if X_parts else X_feat
+    all_names = cov_names + feature_cols
+
+    # Model: elastic-net (saga) + standardize
+    # Use class_weight balanced for rare events
+    model = Pipeline([
+        ("scaler", StandardScaler(with_mean=True, with_std=True)),
+        ("clf", LogisticRegression(
+            penalty="elasticnet",
+            solver="saga",
+            l1_ratio=0.5,          # we will tune slightly by trying a few values
+            C=1.0,
+            max_iter=5000,
+            class_weight="balanced",
+            random_state=seed
+        ))
+    ])
+
+    # We do simple hyperparam sweep inside each split (tiny data, keep stable)
+    l1_grid = [0.1, 0.3, 0.5, 0.7, 0.9]
+    C_grid = [0.1, 0.3, 1.0, 3.0, 10.0]
+
+    rkf = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=seed)
+
+    # collect importance for feature columns only (exclude covariates)
+    feat_idx = [all_names.index(f) for f in feature_cols]
+    importances = {f: [] for f in feature_cols}
+    selected = {f: 0 for f in feature_cols}
+    total_fits = 0
+
+    for train_idx, test_idx in rkf.split(X, y):
+        Xtr, Xte = X[train_idx], X[test_idx]
+        ytr, yte = y[train_idx], y[test_idx]
+
+        # inner CV for hyperparams (very light)
+        best_auc = -np.inf
+        best_params = None
+        inner = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
+
+        for l1 in l1_grid:
+            for C in C_grid:
+                aucs = []
+                for itrn, ival in inner.split(Xtr, ytr):
+                    m = Pipeline([
+                        ("scaler", StandardScaler()),
+                        ("clf", LogisticRegression(
+                            penalty="elasticnet", solver="saga",
+                            l1_ratio=l1, C=C, max_iter=5000,
+                            class_weight="balanced",
+                            random_state=seed
+                        ))
+                    ])
+                    m.fit(Xtr[itrn], ytr[itrn])
+                    # use decision_function; fallback to predict_proba
+                    try:
+                        score = m.decision_function(Xtr[ival])
+                    except Exception:
+                        score = m.predict_proba(Xtr[ival])[:, 1]
+                    # AUC can error if fold becomes single-class (rare but possible)
+                    if len(np.unique(ytr[ival])) < 2:
+                        continue
+                    aucs.append(roc_auc_score(ytr[ival], score))
+                if len(aucs) == 0:
+                    continue
+                mean_auc = float(np.mean(aucs))
+                if mean_auc > best_auc:
+                    best_auc = mean_auc
+                    best_params = (l1, C)
+
+        if best_params is None:
+            continue
+
+        # fit best model on train
+        l1, C = best_params
+        model = Pipeline([
+            ("scaler", StandardScaler()),
+            ("clf", LogisticRegression(
+                penalty="elasticnet", solver="saga",
+                l1_ratio=l1, C=C, max_iter=5000,
+                class_weight="balanced",
+                random_state=seed
+            ))
+        ])
+        model.fit(Xtr, ytr)
+        total_fits += 1
+
+        # selection frequency from coefficients (after scaling)
+        coef = model.named_steps["clf"].coef_.reshape(-1)
+        for f, idx in zip(feature_cols, feat_idx):
+            if abs(coef[idx]) > 1e-8:
+                selected[f] += 1
+
+        # permutation importance on test set for FEATURES only
+        # scoring AUC; use predict_proba
+        def scorer(est, X_, y_):
+            p = est.predict_proba(X_)[:, 1]
+            if len(np.unique(y_)) < 2:
+                return np.nan
+            return roc_auc_score(y_, p)
+
+        perm = permutation_importance(
+            model, Xte, yte,
+            scoring=scorer,
+            n_repeats=50,
+            random_state=seed
+        )
+        # perm.importances_mean corresponds to all columns in X
+        for f, idx in zip(feature_cols, feat_idx):
+            importances[f].append(float(perm.importances_mean[idx]))
+
+    # aggregate
+    rows = []
+    for f in feature_cols:
+        imp = np.array(importances[f], dtype=float)
+        imp = imp[np.isfinite(imp)]
+        if len(imp) == 0:
+            mean_imp = np.nan
+            lo = hi = np.nan
+        else:
+            mean_imp = float(np.mean(imp))
+            lo, hi = np.quantile(imp, [0.025, 0.975])
+            lo, hi = float(lo), float(hi)
+
+        freq = selected[f] / max(total_fits, 1)
+        rows.append({
+            "feature": f,
+            "perm_importance_mean": mean_imp,
+            "perm_importance_ci_low": lo,
+            "perm_importance_ci_high": hi,
+            "selection_freq": freq,
+            "n_fits": total_fits
+        })
+
+    out = pd.DataFrame(rows)
+    return out, data
+
+def build_final_ranking(df, y_col="torpor", feature_cols=None, covariates=None, seed=0):
+    feature_cols = feature_cols or []
+    covariates = covariates or []
+
+    # univariate aucs
+    auc_rows = []
+    tmp = df[[y_col] + feature_cols].replace([np.inf, -np.inf], np.nan).dropna()
+    y = tmp[y_col].astype(int).values
+
+    for f in feature_cols:
+        auc, lo, hi = bootstrap_auc(tmp[f].astype(float).values, y, n_boot=2000, seed=seed)
+        auc_rows.append({"feature": f, "auc": auc, "auc_ci_low": lo, "auc_ci_high": hi})
+    auc_df = pd.DataFrame(auc_rows)
+
+    # multivariate perm importance + selection freq
+    perm_df, used_data = cv_perm_importance_ranking(
+        df=df, y_col=y_col, feature_cols=feature_cols, add_covariates=covariates,
+        n_splits=4, n_repeats=100, seed=seed
+    )
+
+    # merge & rank
+    res = perm_df.merge(auc_df, on="feature", how="left")
+
+    # rank key: perm_importance_mean desc, then selection_freq desc, then auc desc
+    res["rank"] = res.sort_values(
+        by=["perm_importance_mean", "selection_freq", "auc"],
+        ascending=[False, False, False]
+    ).reset_index(drop=True).index + 1
+
+    res = res.sort_values("rank")
+    return res, used_data
+
+# ------------------------------------------------
+# 7) Run two analyses:
+#    A) US+ only  (recommended)
+#    B) all samples adjusted for group+sex
+# ------------------------------------------------
+
+# A) US+ only (sex as covariate optional)
+df_us = master[master["group"].astype(str) == "US+"].copy()
+df_us = df_us[["torpor", "sex"] + cont_cols].replace([np.inf, -np.inf], np.nan).dropna()
+
+print("US+ samples:", len(df_us), "torpor rate:", df_us["torpor"].mean())
+
+rank_us, used_us = build_final_ranking(
+    df=df_us, y_col="torpor",
+    feature_cols=cont_cols,
+    covariates=["sex"],    # 你也可以设 [] 彻底不控制sex
+    seed=0
+)
+
+print("\n=== Ranking A: within US+ (priority list) ===")
+print(rank_us[[
+    "rank", "feature",
+    "perm_importance_mean", "perm_importance_ci_low", "perm_importance_ci_high",
+    "selection_freq",
+    "auc", "auc_ci_low", "auc_ci_high",
+    "n_fits"
+]])
+
+# B) All samples, adjusted for group + sex (conditional importance)
+df_all = master[["torpor", "group", "sex"] + cont_cols].copy()
+df_all = df_all.replace([np.inf, -np.inf], np.nan).dropna()
+
+print("\nAll samples:", len(df_all), "torpor rate:", df_all["torpor"].mean())
+
+rank_all_adj, used_all = build_final_ranking(
+    df=df_all, y_col="torpor",
+    feature_cols=cont_cols,
+    covariates=["group", "sex"],
+    seed=0
+)
+
+print("\n=== Ranking B: all samples, adjusted for group+sex (conditional priority) ===")
+print(rank_all_adj[[
+    "rank", "feature",
+    "perm_importance_mean", "perm_importance_ci_low", "perm_importance_ci_high",
+    "selection_freq",
+    "auc", "auc_ci_low", "auc_ci_high",
+    "n_fits"
+]])
+
+print("\n✅ Done. Use Ranking A (US+ only) as your main 'feature priority for torpor'.")
