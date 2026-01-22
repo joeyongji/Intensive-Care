@@ -1,0 +1,314 @@
+
+import os
+import numpy as np
+import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.metrics import mean_squared_error
+
+
+XLSX_PATH = "Organized data.xlsx"
+
+SHEETS = {
+    "tcore": ("Tcore torpor-like", "Tcore nontorpor"),
+    "vo2":   ("VO2 torpor-like", "VO2 nontorpor"),
+    "act":   ("activity torpor-like", "ativity nontorpor"),  # typo matches file
+    "hr":    ("Heart Rate torpor-like", "Heart Rate nontorpor"),
+}
+
+OUTDIR = "rf_dynamic_outputs_v2"
+os.makedirs(OUTDIR, exist_ok=True)
+
+RANDOM_STATE = 0
+
+
+RF_PARAMS = dict(
+    n_estimators=500,
+    max_depth=12,
+    min_samples_leaf=3,
+    max_features=0.7,
+    random_state=RANDOM_STATE,
+    n_jobs=-1,
+)
+
+
+INCLUDE_TIME = True
+USE_LAG_FEATURES = True
+CLIP_TORPOR_TO_TRAIN_RANGE = True  # prevents weird extrapolation into torpor ranges
+
+TIME_MIN = None
+TIME_MAX = None
+
+
+def read_timeseries_sheet(xlsx_path: str, sheet_name: str, value_name: str) -> pd.DataFrame:
+    """
+    Sheet format:
+      row 0: mouse IDs in columns 1..
+      row 1: sex labels (M/F) in columns 1..
+      row 2+: time in col 0 and values in columns 1..
+    Returns long-form: Time, Subject_ID, Sex, <value_name>
+    """
+    df_raw = pd.read_excel(xlsx_path, sheet_name=sheet_name, header=None)
+
+    mouse_ids = df_raw.iloc[0, 1:].astype(str).tolist()
+    sex_labels = df_raw.iloc[1, 1:].astype(str).tolist()
+    sex_map = dict(zip(mouse_ids, sex_labels))
+
+    time = pd.to_numeric(df_raw.iloc[2:, 0], errors="coerce")
+    vals = df_raw.iloc[2:, 1:]
+    vals.columns = mouse_ids
+    vals = vals.apply(pd.to_numeric, errors="coerce")
+
+    df_long = vals.copy()
+    df_long.insert(0, "Time", time.values)
+    df_long = df_long.melt(id_vars=["Time"], var_name="Subject_ID", value_name=value_name)
+    df_long["Sex"] = df_long["Subject_ID"].map(sex_map)
+
+    return df_long
+
+
+def build_master(xlsx_path: str) -> pd.DataFrame:
+    parts = []
+    for condition_label, idx in [("torpor_like", 0), ("nontorpor", 1)]:
+        vo2 = read_timeseries_sheet(xlsx_path, SHEETS["vo2"][idx], "VO2")
+        vo2["Condition"] = condition_label
+
+        tcore = read_timeseries_sheet(xlsx_path, SHEETS["tcore"][idx], "Tcore")
+        act = read_timeseries_sheet(xlsx_path, SHEETS["act"][idx], "Activity")
+        hr = read_timeseries_sheet(xlsx_path, SHEETS["hr"][idx], "HeartRate")
+
+        key = ["Time", "Subject_ID"]
+        df = vo2.merge(tcore[key + ["Tcore"]], on=key, how="left")
+        df = df.merge(act[key + ["Activity"]], on=key, how="left")
+        df = df.merge(hr[key + ["HeartRate"]], on=key, how="left")
+
+        parts.append(df)
+
+    master = pd.concat(parts, ignore_index=True)
+
+    # numeric coercion
+    master["Time"] = pd.to_numeric(master["Time"], errors="coerce")
+    for c in ["VO2", "Tcore", "Activity", "HeartRate"]:
+        master[c] = pd.to_numeric(master[c], errors="coerce")
+
+    master["Sex"] = master["Sex"].fillna("U")
+    master["Condition"] = master["Condition"].astype(str)
+    master["Subject_ID"] = master["Subject_ID"].astype(str)
+
+    if TIME_MIN is not None:
+        master = master[master["Time"] >= float(TIME_MIN)]
+    if TIME_MAX is not None:
+        master = master[master["Time"] <= float(TIME_MAX)]
+
+    return master.reset_index(drop=True)
+
+
+
+def add_predictor_lags(df: pd.DataFrame, group_cols=("Condition", "Subject_ID")) -> pd.DataFrame:
+    """
+    Adds lag1 and delta for predictors (Tcore/HeartRate/Activity) within each mouse within each condition.
+    Does NOT create VO2 lag.
+    """
+    df = df.sort_values(list(group_cols) + ["Time"]).copy()
+    for col in ["Tcore", "HeartRate", "Activity"]:
+        df[f"{col}_lag1"] = df.groupby(list(group_cols))[col].shift(1)
+        df[f"d{col}"] = df[col] - df[f"{col}_lag1"]
+    return df
+
+
+def clip_to_train_range(df_in: pd.DataFrame, train_ref: pd.DataFrame, cols: list) -> pd.DataFrame:
+    df_out = df_in.copy()
+    for c in cols:
+        lo = train_ref[c].min()
+        hi = train_ref[c].max()
+        df_out[c] = df_out[c].clip(lo, hi)
+    return df_out
+
+
+def rmse(y_true, y_pred) -> float:
+    return float(np.sqrt(mean_squared_error(y_true, y_pred)))
+
+
+# LOSO BASELINE + OOS TORPOR RESIDUALS
+def run_loso_rf(df_all: pd.DataFrame) -> None:
+    df = df_all.copy()
+
+    # sex encode
+    df["Sex_Encoded"] = df["Sex"].map({"M": 0, "F": 1}).fillna(0).astype(int)
+
+    # add predictor lags/deltas
+    if USE_LAG_FEATURES:
+        df = add_predictor_lags(df)
+
+    # define feature columns
+    base_feats = []
+    if INCLUDE_TIME:
+        base_feats.append("Time")
+    base_feats += ["Tcore", "HeartRate", "Activity", "Sex_Encoded"]
+
+    lag_feats = []
+    if USE_LAG_FEATURES:
+        lag_feats = ["Tcore_lag1", "HeartRate_lag1", "Activity_lag1", "dTcore", "dHeartRate", "dActivity"]
+
+    feature_cols = base_feats + lag_feats
+
+
+    # Training data = Non-torpor
+
+    non = df[df["Condition"] == "nontorpor"].copy()
+    # require VO2 + all needed predictors present
+    non = non.dropna(subset=["VO2"] + feature_cols).copy()
+
+    print(f"Non-torpor rows: {len(non)}  Non-torpor mice: {non['Subject_ID'].nunique()}")
+
+    X_non = non[feature_cols].copy()
+    y_non = non["VO2"].values
+    groups = non["Subject_ID"].values
+
+    logo = LeaveOneGroupOut()
+
+    oos_non_rows = []
+    oos_torpor_rows = []
+    fold_rmses = []
+
+    for fold_i, (tr, te) in enumerate(logo.split(X_non, y_non, groups=groups), start=1):
+        test_mouse = pd.Series(groups[te]).iloc[0]
+
+        train_non = non.iloc[tr].copy()
+        test_non = non.iloc[te].copy()
+
+        # equalize mouse weights within training fold
+        counts = train_non["Subject_ID"].value_counts()
+        wtr = train_non["Subject_ID"].map(lambda g: 1.0 / counts[g]).values.astype(float)
+
+        rf = RandomForestRegressor(**RF_PARAMS)
+        rf.fit(train_non[feature_cols], train_non["VO2"].values, sample_weight=wtr)
+
+        # OOS non-torpor predictions (held-out mouse)
+        pred_non = rf.predict(test_non[feature_cols])
+        fold_rmse = rmse(test_non["VO2"].values, pred_non)
+        fold_rmses.append(fold_rmse)
+        print(f"fold {fold_i:02d} | test=Non-torpor|{test_mouse} | RMSE={fold_rmse:.4f}")
+
+        tmp_non = test_non[["Time", "Subject_ID"]].copy()
+        tmp_non["Group"] = "Non-torpor"
+        tmp_non["VO2_obs"] = test_non["VO2"].values
+        tmp_non["VO2_pred"] = pred_non
+        oos_non_rows.append(tmp_non)
+
+        # OOS torpor-like predictions for SAME held-out mouse (baseline model)
+        tor = df[(df["Condition"] == "torpor_like") & (df["Subject_ID"] == test_mouse)].copy()
+        if len(tor) == 0:
+            continue
+
+        tor = tor.dropna(subset=["VO2"] + feature_cols).copy()
+        if len(tor) == 0:
+            continue
+
+        # clip torpor predictors to training ranges (non-torpor train fold)
+        tor_for_pred = tor.copy()
+        if CLIP_TORPOR_TO_TRAIN_RANGE:
+            clip_cols = [c for c in feature_cols if c not in ["Sex_Encoded"]]
+            tor_for_pred = clip_to_train_range(tor_for_pred, train_non, clip_cols)
+
+        pred_tor = rf.predict(tor_for_pred[feature_cols])
+
+        tmp_tor = tor[["Time", "Subject_ID"]].copy()
+        tmp_tor["Group"] = "Torpor-like"
+        tmp_tor["VO2_obs"] = tor["VO2"].values
+        tmp_tor["VO2_pred"] = pred_tor
+        tmp_tor["Residual"] = tmp_tor["VO2_obs"] - tmp_tor["VO2_pred"]
+        oos_torpor_rows.append(tmp_tor)
+
+
+    oos_non = pd.concat(oos_non_rows, ignore_index=True) if oos_non_rows else pd.DataFrame()
+    oos_tor = pd.concat(oos_torpor_rows, ignore_index=True) if oos_torpor_rows else pd.DataFrame()
+
+    non_csv = os.path.join(OUTDIR, "oos_non_torpor_predictions.csv")
+    tor_csv = os.path.join(OUTDIR, "oos_torpor_predictions_and_residuals.csv")
+
+    oos_non.to_csv(non_csv, index=False)
+    oos_tor.to_csv(tor_csv, index=False)
+
+    print(f"\nNon-torpor LOSO RMSE mean={np.mean(fold_rmses):.4f}, std={np.std(fold_rmses):.4f}")
+    print(f"Saved: {non_csv}")
+    print(f"Saved: {tor_csv}")
+
+
+    if len(oos_non) > 0:
+        plt.figure(figsize=(7, 7))
+        plt.scatter(oos_non["VO2_obs"].values, oos_non["VO2_pred"].values, alpha=0.5)
+        mn = float(min(oos_non["VO2_obs"].min(), oos_non["VO2_pred"].min()))
+        mx = float(max(oos_non["VO2_obs"].max(), oos_non["VO2_pred"].max()))
+        plt.plot([mn, mx], [mn, mx], linestyle="--")
+        plt.xlabel("VO2 actual (non-torpor, OOS)")
+        plt.ylabel("VO2 predicted (non-torpor, OOS)")
+        plt.title("Baseline RF: OOS predicted vs actual (non-torpor)")
+        plt.tight_layout()
+        out = os.path.join(OUTDIR, "figB_non_torpor_pred_vs_actual.png")
+        plt.savefig(out, dpi=300)
+        plt.close()
+        print(f"Saved: {out}")
+
+
+    if len(oos_non) > 0 and len(oos_tor) > 0:
+        g_non = (oos_non.groupby("Time", as_index=False)
+                      .agg(VO2_obs_mean=("VO2_obs", "mean"),
+                           VO2_pred_mean=("VO2_pred", "mean")))
+        g_tor = (oos_tor.groupby("Time", as_index=False)
+                      .agg(VO2_obs_mean=("VO2_obs", "mean"),
+                           VO2_pred_mean=("VO2_pred", "mean")))
+
+        plt.figure(figsize=(12, 5))
+        # Non-torpor
+        plt.plot(g_non["Time"], g_non["VO2_obs_mean"], label="Non-torpor Actual")
+        plt.plot(g_non["Time"], g_non["VO2_pred_mean"], linestyle="--", label="Non-torpor Predicted (baseline)")
+        # Torpor-like
+        plt.plot(g_tor["Time"], g_tor["VO2_obs_mean"], label="Torpor-like Actual")
+        plt.plot(g_tor["Time"], g_tor["VO2_pred_mean"], linestyle="--", label="Torpor-like Predicted (by baseline)")
+        plt.xlabel("Time (min)")
+        plt.ylabel("Mean VO2 (OOS only)")
+        plt.title("RF baseline (trained on Non-torpor, LOSO): mean VO2 over time (actual vs expected)")
+        plt.legend(ncol=2)
+        plt.tight_layout()
+        out = os.path.join(OUTDIR, "figA_mean_vo2_over_time_actual_vs_pred.png")
+        plt.savefig(out, dpi=300)
+        plt.close()
+        print(f"Saved: {out}")
+
+
+    if len(oos_tor) > 0:
+        gt = (oos_tor.groupby("Time", as_index=False)
+                    .agg(mean_res=("Residual", "mean"),
+                         std_res=("Residual", "std"),
+                         n=("Residual", "size")))
+        gt["sem"] = gt["std_res"] / np.sqrt(gt["n"].clip(lower=1))
+
+        plt.figure(figsize=(12, 4))
+        plt.plot(gt["Time"].values, gt["mean_res"].values)
+        plt.fill_between(
+            gt["Time"].values,
+            (gt["mean_res"] - gt["sem"]).values,
+            (gt["mean_res"] + gt["sem"]).values,
+            alpha=0.2
+        )
+        plt.axhline(0, linestyle="--")
+        plt.xlabel("Time (min)")
+        plt.ylabel("Residual VO2 (obs - expected)")
+        plt.title("Torpor-like: mean residual over time (OOS only) ± SEM")
+        plt.tight_layout()
+        out = os.path.join(OUTDIR, "figC_torpor_mean_residual_over_time_sem.png")
+        plt.savefig(out, dpi=300)
+        plt.close()
+        print(f"Saved: {out}")
+
+
+
+if __name__ == "__main__":
+    df_master = build_master(XLSX_PATH)
+    run_loso_rf(df_master)
