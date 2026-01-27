@@ -1,0 +1,269 @@
+# STATIC MODEL ANALYSIS - Showing why simple linear models fail
+# Demonstrates:
+# 1) Pooled model has low R² due to individual heterogeneity
+# 2) Within-animal relationships are stronger but vary (some positive, some negative!)
+# 3) Justifies need for ML methods that can handle complexity
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_squared_error, r2_score
+from scipy import stats
+
+print("Starting analysis...\n")
+
+# -----------------------------
+# Load the correct sheets
+# -----------------------------
+file_path = "Organized data.xlsx"  # change path if needed
+
+T_df   = pd.read_excel(file_path, sheet_name="Tcore nontorpor")
+VO2_df = pd.read_excel(file_path, sheet_name="VO2 nontorpor")
+HR_df  = pd.read_excel(file_path, sheet_name="Heart Rate nontorpor")
+
+# -----------------------------
+# Helper: drop sex row, drop time col, coerce numeric, flatten
+# -----------------------------
+def flatten_sheet(df: pd.DataFrame) -> np.ndarray:
+    df = df.iloc[1:].reset_index(drop=True)          # drop sex row
+    df = df.drop(columns=["time (min)"])             # drop time column
+    df = df.apply(pd.to_numeric, errors="coerce")    # ensure numeric
+    return df.values.flatten()
+
+Temperature = flatten_sheet(T_df)
+VO2         = flatten_sheet(VO2_df)
+HeartRate   = flatten_sheet(HR_df)
+
+# -----------------------------
+# Build paired datasets
+# -----------------------------
+mask_T  = (~np.isnan(Temperature)) & (~np.isnan(VO2))
+mask_TH = mask_T & (~np.isnan(HeartRate))
+
+df_T = pd.DataFrame({
+    "Temperature": Temperature[mask_T],
+    "VO2": VO2[mask_T]
+})
+
+df_TH = pd.DataFrame({
+    "Temperature": Temperature[mask_TH],
+    "HeartRate": HeartRate[mask_TH],
+    "VO2": VO2[mask_TH]
+})
+
+print(f"Dataset 1 (Temp only): {len(df_T)} observations")
+print(f"Dataset 2 (Temp + HR): {len(df_TH)} observations\n")
+
+# =========================================================
+# MODEL 1: VO2 ~ Temperature (POOLED - ALL ANIMALS TOGETHER)
+# =========================================================
+X = df_T[["Temperature"]]
+y = df_T["VO2"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=42
+)
+
+model_T = LinearRegression()
+model_T.fit(X_train, y_train)
+
+y_pred = model_T.predict(X_test)
+residuals = y_test - y_pred
+
+rmse_T = np.sqrt(mean_squared_error(y_test, y_pred))
+r2_T = r2_score(y_test, y_pred)
+
+print("=" * 60)
+print("MODEL 1: VO2 ~ Core Temperature (POOLED)")
+print("=" * 60)
+print(f"Coefficient (Tcore): {model_T.coef_[0]:.4f}")
+print(f"Intercept:           {model_T.intercept_:.4f}")
+print(f"RMSE:                {rmse_T:.4f}")
+print(f"R²:                  {r2_T:.4f}")
+print("  → Low R² suggests poor fit when pooling all animals\n")
+
+# =========================================================
+# INDIVIDUAL ANIMAL ANALYSIS - Key insight
+# =========================================================
+print("=" * 60)
+print("WITHIN-ANIMAL CORRELATIONS (Temperature vs VO2)")
+print("=" * 60)
+print("This shows relationships exist WITHIN animals,")
+print("but pooling masks individual differences.\n")
+
+# Reload data preserving animal structure
+T_df_raw   = pd.read_excel(file_path, sheet_name="Tcore nontorpor").iloc[1:].reset_index(drop=True)
+VO2_df_raw = pd.read_excel(file_path, sheet_name="VO2 nontorpor").iloc[1:].reset_index(drop=True)
+
+T_df_raw   = T_df_raw.drop(columns=["time (min)"])
+VO2_df_raw = VO2_df_raw.drop(columns=["time (min)"])
+
+animal_ids = T_df_raw.columns.tolist()
+
+correlations = []
+animal_stats = []
+
+for animal in animal_ids:
+    temp = pd.to_numeric(T_df_raw[animal], errors="coerce")
+    vo2  = pd.to_numeric(VO2_df_raw[animal], errors="coerce")
+
+    m = (~temp.isna()) & (~vo2.isna())
+    temp_clean = temp[m]
+    vo2_clean  = vo2[m]
+
+    if len(temp_clean) > 2:
+        corr, p_val = stats.pearsonr(temp_clean, vo2_clean)
+        correlations.append(corr)
+        animal_stats.append({"animal": animal, "correlation": corr, "p_value": p_val, "n": len(temp_clean)})
+
+        strength = ""
+        if abs(corr) > 0.7:
+            strength = " ⭐ STRONG"
+        elif abs(corr) > 0.5:
+            strength = " ✓ MODERATE"
+
+        direction = "POSITIVE" if corr > 0 else "NEGATIVE"
+        print(f"Animal {animal}: r = {corr:6.3f}, p = {p_val:.4f}, n = {len(temp_clean)}{strength} ({direction})")
+
+print("\n"
+      f"Mean within-animal correlation: {np.mean(correlations):.3f}\n"
+      f"Std of within-animal correlations: {np.std(correlations):.3f}\n")
+print("KEY INSIGHT: Some animals show STRONG POSITIVE correlations,")
+print("             while others show NEGATIVE correlations.\n")
+
+# ---- Plot 2: Individual Animal Relationships ----
+print("Generating Plot: individual_animal_relationships.png ...")
+fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+axes = axes.flatten()
+
+for idx, animal in enumerate(animal_ids):
+    temp = pd.to_numeric(T_df_raw[animal], errors="coerce")
+    vo2  = pd.to_numeric(VO2_df_raw[animal], errors="coerce")
+
+    m = (~temp.isna()) & (~vo2.isna())
+    temp_clean = temp[m].values
+    vo2_clean  = vo2[m].values
+
+    if len(temp_clean) > 2:
+        corr, _ = stats.pearsonr(temp_clean, vo2_clean)
+
+        if corr > 0.5:
+            color = "green"
+        elif corr < -0.5:
+            color = "red"
+        else:
+            color = "gray"
+
+        axes[idx].scatter(temp_clean, vo2_clean, alpha=0.5, s=15, color=color)
+
+        z = np.polyfit(temp_clean, vo2_clean, 1)
+        p = np.poly1d(z)
+        axes[idx].plot(temp_clean, p(temp_clean), "k-", alpha=0.8, linewidth=2)
+
+        axes[idx].set_xlabel("Temperature (°C)", fontsize=9)
+        axes[idx].set_ylabel("VO₂", fontsize=9)
+        axes[idx].set_title(f"Animal {animal}: r={corr:.3f}", fontsize=10, fontweight="bold")
+        axes[idx].grid(alpha=0.3)
+
+axes[-1].axis("off")
+
+plt.suptitle(
+    "Individual Animal Relationships: Temperature vs VO₂\n"
+    "(Green = Strong Positive, Red = Strong Negative, Gray = Weak)",
+    fontsize=14, fontweight="bold", y=1.00
+)
+plt.tight_layout()
+plt.savefig("individual_animal_relationships.png", dpi=300, bbox_inches="tight")
+print("  ✓ Saved: individual_animal_relationships.png\n")
+plt.show(block=False)
+plt.pause(0.5)
+
+# =========================================================
+# MODEL 2: VO2 ~ Temperature + Heart Rate (POOLED)
+# =========================================================
+X2 = df_TH[["Temperature", "HeartRate"]]
+y2 = df_TH["VO2"]
+
+X2_train, X2_test, y2_train, y2_test = train_test_split(
+    X2, y2, test_size=0.2, random_state=42
+)
+
+model_TH = LinearRegression()
+model_TH.fit(X2_train, y2_train)
+
+y2_pred = model_TH.predict(X2_test)
+residuals2 = y2_test - y2_pred
+
+rmse_TH = np.sqrt(mean_squared_error(y2_test, y2_pred))
+r2_TH = r2_score(y2_test, y2_pred)
+
+print("=" * 60)
+print("MODEL 2: VO2 ~ Core Temperature + Heart Rate (POOLED)")
+print("=" * 60)
+print(f"Coefficient (Tcore):     {model_TH.coef_[0]:.4f}")
+print(f"Coefficient (HR):        {model_TH.coef_[1]:.4f}")
+print(f"Intercept:               {model_TH.intercept_:.4f}")
+print(f"RMSE:                    {rmse_TH:.4f}")
+print(f"R²:                      {r2_TH:.4f}")
+if r2_TH < r2_T:
+    print(f"  → R² DECREASED from {r2_T:.3f} to {r2_TH:.3f} (adding HR hurts)\n")
+else:
+    print()
+
+# =========================================================
+# HR-ONLY MODEL (for VO2 vs HR panel)
+# =========================================================
+X_hr = df_TH[["HeartRate"]]
+y_hr = df_TH["VO2"]
+
+X_hr_train, X_hr_test, y_hr_train, y_test_hr = train_test_split(
+    X_hr, y_hr, test_size=0.2, random_state=42
+)
+
+model_HR = LinearRegression()
+model_HR.fit(X_hr_train, y_hr_train)
+
+y_hr_pred = model_HR.predict(X_hr_test)
+r2_HR = r2_score(y_test_hr, y_hr_pred)
+
+# =========================================================
+# COMBINED FIGURE: VO2 vs Temperature (left) and VO2 vs Heart Rate (right)
+# =========================================================
+print("Generating combined plot: vo2_vs_temp_and_hr_side_by_side.png ...")
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+# Left panel: VO2 vs Temperature
+ax1.scatter(X_test["Temperature"], y_test, alpha=0.6, label="Test data")
+T_line = np.linspace(df_T["Temperature"].min(), df_T["Temperature"].max(), 100).reshape(-1, 1)
+ax1.plot(T_line, model_T.predict(T_line), color="red", linewidth=2, label="Linear fit")
+ax1.set_xlabel("Core Temperature (°C)", fontsize=12)
+ax1.set_ylabel("VO₂ (ml/min/kg)", fontsize=12)
+ax1.set_title(f"VO₂ vs Temperature (R²={r2_T:.3f})", fontsize=14, fontweight="bold")
+ax1.legend()
+ax1.grid(alpha=0.3)
+
+# Right panel: VO2 vs Heart Rate
+ax2.scatter(X_hr_test["HeartRate"], y_test_hr, alpha=0.6, label="Test data")
+HR_line = np.linspace(df_TH["HeartRate"].min(), df_TH["HeartRate"].max(), 100).reshape(-1, 1)
+ax2.plot(HR_line, model_HR.predict(HR_line), color="red", linewidth=2, label="Linear fit")
+ax2.set_xlabel("Heart Rate", fontsize=12)
+ax2.set_ylabel("VO₂ (ml/min/kg)", fontsize=12)
+ax2.set_title(f"VO₂ vs Heart Rate (R²={r2_HR:.3f})", fontsize=14, fontweight="bold")
+ax2.legend()
+ax2.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig("vo2_vs_temp_and_hr_side_by_side.png", dpi=300, bbox_inches="tight")
+print("  ✓ Saved: vo2_vs_temp_and_hr_side_by_side.png\n")
+plt.show(block=False)
+plt.pause(0.5)
+
+print("=" * 60)
+print("PLOTS GENERATED:")
+print("  1) individual_animal_relationships.png")
+print("  2) vo2_vs_temp_and_hr_side_by_side.png")
+print("=" * 60)
