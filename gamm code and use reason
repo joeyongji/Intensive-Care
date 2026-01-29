@@ -1,0 +1,329 @@
+We used GAMM because it can explicitly model within-subject correlation via random effects/correlation structures; ignoring correlation can lead to overfitting and overly optimistic inference.
+
+https://stat.ethz.ch/R-manual/R-devel/library/mgcv/html/gamm.html
+
+
+
+GAMMs extend GAMs by incorporating random effects and are widely used for correlated/clustered responses, such as longitudinal and repeated-measures data.
+
+https://pmc.ncbi.nlm.nih.gov/articles/PMC3644420/
+
+
+
+We used a generalized additive mixed model (GAMM) rather than a standard GAM because our dataset consists of repeated time-series measurements nested within individual mice. Observations from the same mouse are not independent and mice can differ in baseline metabolic rate and other unobserved characteristics; ignoring this clustered structure in a GAM can distort the estimated smooth effects and lead to overly optimistic uncertainty. A GAMM retains the flexibility and interpretability of smooth, potentially nonlinear covariate effects while explicitly accounting for between-mouse heterogeneity (e.g., via random intercepts) and within-mouse dependence, making it a more appropriate model for longitudinal physiological data and for evaluating generalization across animals (e.g., under leave-one-mouse-out validation).
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+import statsmodels.api as sm
+from statsmodels.regression.mixed_linear_model import MixedLM
+
+from patsy import dmatrix, build_design_matrices
+
+# ============================================================
+# 0) 配置（Colab 路径）
+# ============================================================
+PATH = "/content/Organized data.xlsx"  # ✅ Colab 左侧 Files 根目录（你上传文件后在这里）
+
+SHEETS = {
+    ("torpor", "Tcore"): "Tcore torpor-like",
+    ("non", "Tcore"): "Tcore nontorpor",
+    ("torpor", "VO2"): "VO2 torpor-like",
+    ("non", "VO2"): "VO2 nontorpor",
+    ("torpor", "Activity"): "activity torpor-like",
+    ("non", "Activity"): "ativity nontorpor",
+    ("torpor", "RQ"): "Heart Rate torpor-like",
+    ("non", "RQ"): "Heart Rate nontorpor",
+}
+
+# ✅ Test1 要求：只用 feature-lag，不用 VO2-lag
+LAGS = [1, 2, 3]              # 过去 1/2/3 个时间步（假设 time 是 min）
+USE_DELTA = True              # 加 delta = x(t) - x(t-1)
+TIME_RANGE = (1, 119)
+
+# ✅ 为避免 bs() 外推报错：所有验证/测试都做 fold 内 clip
+CLIP_IN_FOLDS = True
+CLIP_TORPOR_TO_NON = True
+
+# ✅ spline 复杂度：在 non 上 LOSO 选择（越大越灵活，越慢）
+SPLINE_DF_GRID = [5, 7, 9]
+
+# ============================================================
+# 1) 读表：宽表 -> 长表，并提取性别
+# ============================================================
+def read_wide_sheet(sheet_name: str):
+    try:
+        df = pd.read_excel(PATH, sheet_name=sheet_name)
+    except ValueError:
+        print(f"❌ Error: Sheet '{sheet_name}' not found.")
+        return None, None
+
+    time_col = df.columns[0]
+
+    first_row = df.iloc[0]
+    if first_row.astype(str).str.contains('M|F', regex=True).any():
+        mouse_cols = [c for c in df.columns[1:]]
+        gender_map = {str(c): str(first_row[c]).strip() for c in mouse_cols}
+        df_num = df.iloc[1:].copy()
+    else:
+        gender_row = df[df[time_col].isna()]
+        if not gender_row.empty:
+            gender_row = gender_row.iloc[0]
+            mouse_cols = [c for c in df.columns[1:]]
+            gender_map = {str(c): str(gender_row[c]).strip() for c in mouse_cols}
+            df_num = df[df[time_col].notna()].copy()
+        else:
+            print(f"⚠️ Warning: No gender info in {sheet_name}")
+            gender_map = None
+            df_num = df.copy()
+
+    df_num = df_num.rename(columns={time_col: "time"})
+    long = df_num.melt(id_vars=["time"], var_name="mouse_id", value_name="value")
+    long["mouse_id"] = long["mouse_id"].astype(str)
+    return long, gender_map
+
+
+def build_long_dataset():
+    parts = []
+    gender_master = {}
+
+    for (cond, var), sh in SHEETS.items():
+        long, gmap = read_wide_sheet(sh)
+        if long is None:
+            continue
+
+        if gmap:
+            for k, v in gmap.items():
+                if k not in gender_master:
+                    gender_master[k] = v
+
+        long["condition"] = cond
+        long["var"] = var
+        parts.append(long)
+
+    df_all = pd.concat(parts, ignore_index=True)
+
+    df_wide = (
+        df_all.pivot_table(
+            index=["condition", "time", "mouse_id"],
+            columns="var",
+            values="value",
+            aggfunc="mean"
+        )
+        .reset_index()
+    )
+
+    df_wide["gender"] = df_wide["mouse_id"].map(gender_master)
+    return df_wide
+
+
+# ============================================================
+# 2) 特征工程：feature-lag（只对生理特征做 lag/delta）
+# ============================================================
+def add_feature_lags(df: pd.DataFrame, base_cols, lags, use_delta=True):
+    df = df.sort_values(["condition", "mouse_id", "time"]).copy()
+
+    for col in base_cols:
+        for L in lags:
+            df[f"{col}_lag{L}"] = df.groupby(["condition", "mouse_id"])[col].shift(L)
+
+        if use_delta:
+            df[f"{col}_delta1"] = df[col] - df.groupby(["condition", "mouse_id"])[col].shift(1)
+
+    # 丢掉因为 lag 产生的 NaN
+    need = []
+    for col in base_cols:
+        for L in lags:
+            need.append(f"{col}_lag{L}")
+        if use_delta:
+            need.append(f"{col}_delta1")
+
+    df = df.dropna(subset=need).copy()
+    return df
+
+
+def clip_to_train_range(df_in: pd.DataFrame, train_ref: pd.DataFrame, cols):
+    df_out = df_in.copy()
+    for c in cols:
+        lo, hi = train_ref[c].min(), train_ref[c].max()
+        df_out[c] = df_out[c].clip(lo, hi)
+    return df_out
+
+
+# ============================================================
+# 3) GAMM-like：MixedLM + spline basis（patsy bs()）
+# ============================================================
+def make_spline_design(df: pd.DataFrame, spline_df: int, spline_cols):
+    """
+    固定效应 = 各连续变量的 cubic spline(bs) + gender_code + time
+    随机效应 = (1 | mouse_id) random intercept
+    """
+    for c in spline_cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    terms = [f"bs({c}, df={spline_df}, degree=3, include_intercept=False)" for c in spline_cols]
+    formula = " + ".join(terms) + " + gender_code + time"
+
+    X = dmatrix(formula, df, return_type="dataframe")  # 包含截距 Intercept
+    return X, X.design_info
+
+
+def fit_gamm_mixedlm(y: np.ndarray, X: pd.DataFrame, groups: pd.Series):
+    model = MixedLM(endog=y, exog=X, groups=groups)
+    res = model.fit(reml=True, method="lbfgs", maxiter=500, disp=False)
+    return res
+
+
+def predict_mixedlm(res, X_new: pd.DataFrame):
+    return res.predict(exog=X_new)
+
+
+# ============================================================
+# 4) 构建数据
+# ============================================================
+data = build_long_dataset()
+
+data = data[(data["time"] >= TIME_RANGE[0]) & (data["time"] <= TIME_RANGE[1])].copy()
+
+for c in ["VO2", "Tcore", "Activity", "RQ"]:
+    data[c] = pd.to_numeric(data[c], errors="coerce")
+
+df = data.dropna(subset=["VO2", "Tcore", "Activity", "RQ", "gender", "mouse_id"]).copy()
+df["gender_code"] = (df["gender"].astype(str).str.upper().str.contains("F")).astype(int)
+
+# ✅ feature-lag（不含 VO2-lag）
+base_phys = ["Tcore", "Activity", "RQ"]
+df = add_feature_lags(df, base_phys, LAGS, use_delta=USE_DELTA)
+
+train = df[df["condition"] == "non"].copy()
+test_torpor = df[df["condition"] == "torpor"].copy()
+
+print(f"Train(non) size: {train.shape}, Test(torpor) size: {test_torpor.shape}")
+
+# 需要作为 spline 的连续列：当前值 + lag + delta
+spline_cols = base_phys + [f"{c}_lag{L}" for c in base_phys for L in LAGS]
+if USE_DELTA:
+    spline_cols += [f"{c}_delta1" for c in base_phys]
+
+# ============================================================
+# 5) 在 non 上 LOSO 选择 spline_df（Test1 要求）
+# ============================================================
+logo = LeaveOneGroupOut()
+groups_non = train["mouse_id"].values
+
+best_df = None
+best_rmse = np.inf
+cv_results = []
+
+for spline_df in SPLINE_DF_GRID:
+    rmses, maes = [], []
+
+    for tr_idx, va_idx in logo.split(train, groups=groups_non):
+        tr = train.iloc[tr_idx].copy()
+        va = train.iloc[va_idx].copy()
+
+        # 固定效应设计矩阵（以 tr 为基准）
+        X_tr, design_info = make_spline_design(tr, spline_df=spline_df, spline_cols=spline_cols)
+        y_tr = tr["VO2"].values
+        g_tr = tr["mouse_id"].values
+
+        # 拟合 MixedLM
+        try:
+            res = fit_gamm_mixedlm(y_tr, X_tr, g_tr)
+        except Exception as e:
+            print(f"⚠️ spline_df={spline_df} fold failed: {e}")
+            rmses = [np.inf]
+            maes = [np.inf]
+            break
+
+        # ✅ 关键：fold 内 clip，避免 bs() 外推报错
+        if CLIP_IN_FOLDS:
+            va = clip_to_train_range(va, tr, spline_cols)
+
+        # 验证集用同一个 design_info（保证列一致）
+        X_va = build_design_matrices([design_info], va, return_type="dataframe")[0]
+        y_va = va["VO2"].values
+
+        # 预测：对未见过 mouse，随机效应默认 0（泛化）
+        yhat = predict_mixedlm(res, X_va)
+
+        rmse = np.sqrt(mean_squared_error(y_va, yhat))
+        mae = mean_absolute_error(y_va, yhat)
+
+        rmses.append(rmse)
+        maes.append(mae)
+
+    mean_rmse = float(np.mean(rmses))
+    mean_mae = float(np.mean(maes))
+    cv_results.append((spline_df, mean_rmse, mean_mae))
+    print(f"[LOSO non] spline_df={spline_df} | RMSE={mean_rmse:.4f} | MAE={mean_mae:.4f}")
+
+    if mean_rmse < best_rmse:
+        best_rmse = mean_rmse
+        best_df = spline_df
+
+print("\n===== CV Summary (non, LOSO) =====")
+for sdf, r, a in cv_results:
+    print(f"spline_df={sdf}  RMSE={r:.4f}  MAE={a:.4f}")
+print(f"✅ Best spline_df = {best_df} (RMSE={best_rmse:.4f})")
+
+# ============================================================
+# 6) 最终：用最佳 spline_df 在全部 non 上训练；测试 torpor
+# ============================================================
+X_train, design_info = make_spline_design(train, spline_df=best_df, spline_cols=spline_cols)
+y_train = train["VO2"].values
+g_train = train["mouse_id"].values
+
+final_res = fit_gamm_mixedlm(y_train, X_train, g_train)
+
+print("\n===== Final GAMM-like model fitted on all non =====")
+print(final_res.summary())
+
+# torpor 测试（可选 clip 到 non 范围）
+test_eval = test_torpor.copy()
+if CLIP_TORPOR_TO_NON:
+    test_eval = clip_to_train_range(test_eval, train, spline_cols)
+
+X_tor = build_design_matrices([design_info], test_eval, return_type="dataframe")[0]
+y_tor = test_eval["VO2"].values
+
+yhat_tor = predict_mixedlm(final_res, X_tor)
+
+test_torpor = test_torpor.copy()
+test_torpor["VO2_pred"] = yhat_tor
+
+rmse_tor = np.sqrt(mean_squared_error(test_torpor["VO2"], test_torpor["VO2_pred"]))
+mae_tor = mean_absolute_error(test_torpor["VO2"], test_torpor["VO2_pred"])
+print(f"\n[Torpor test] RMSE: {rmse_tor:.4f}")
+print(f"[Torpor test] MAE : {mae_tor:.4f}")
+
+# 非 torpor 也生成预测值便于画图
+train = train.copy()
+train["VO2_pred"] = predict_mixedlm(final_res, X_train)
+
+# ============================================================
+# 7) 可视化：四条曲线
+# ============================================================
+mean_non = train.groupby("time")[["VO2", "VO2_pred"]].mean().reset_index()
+mean_tor = test_torpor.groupby("time")[["VO2", "VO2_pred"]].mean().reset_index()
+
+plt.figure(figsize=(10, 6))
+
+plt.plot(mean_non["time"], mean_non["VO2"], linestyle='-', label="Non-torpor Actual", alpha=0.6)
+plt.plot(mean_non["time"], mean_non["VO2_pred"], linestyle='--', label="Non-torpor Predicted")
+
+plt.plot(mean_tor["time"], mean_tor["VO2"], linestyle='-', label="Torpor Actual", alpha=0.8)
+plt.plot(mean_tor["time"], mean_tor["VO2_pred"], linestyle='--', label="Torpor Predicted (trained on Non)")
+
+plt.xlabel("Time (min)")
+plt.ylabel("VO2 (Metabolic Rate)")
+plt.title("GAMM-like (MixedLM + Splines): Feature-lag Physiology -> VO2\nTrain on Non-torpor, Test on Torpor")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
