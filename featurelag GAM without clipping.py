@@ -211,8 +211,8 @@ plt.plot(mean_tor["time"], mean_tor["VO2"], 'r-', label="Torpor Actual", alpha=0
 plt.plot(mean_tor["time"], mean_tor["VO2_pred"], 'r--', label="Torpor Predicted (Feature-Lag)")
 
 plt.xlabel("Time (min)")
-plt.ylabel("VO2 (Metabolic Rate)")
-plt.title("Feature-Lag GAM Model: Virtual Sensor Performance")
+plt.ylabel("VO2")
+plt.title("Feature-Lag GAM Model")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
