@@ -1,4 +1,3 @@
-
 import os
 import numpy as np
 import pandas as pd
@@ -9,7 +8,7 @@ import matplotlib.pyplot as plt
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import LeaveOneGroupOut
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
 XLSX_PATH = "Organized data.xlsx"
@@ -26,7 +25,6 @@ os.makedirs(OUTDIR, exist_ok=True)
 
 RANDOM_STATE = 0
 
-
 RF_PARAMS = dict(
     n_estimators=500,
     max_depth=12,
@@ -36,10 +34,9 @@ RF_PARAMS = dict(
     n_jobs=-1,
 )
 
-
 INCLUDE_TIME = True
 USE_LAG_FEATURES = True
-CLIP_TORPOR_TO_TRAIN_RANGE = True  # prevents weird extrapolation into torpor ranges
+CLIP_TORPOR_TO_TRAIN_RANGE = False  
 
 TIME_MIN = None
 TIME_MAX = None
@@ -91,7 +88,6 @@ def build_master(xlsx_path: str) -> pd.DataFrame:
 
     master = pd.concat(parts, ignore_index=True)
 
-    # numeric coercion
     master["Time"] = pd.to_numeric(master["Time"], errors="coerce")
     for c in ["VO2", "Tcore", "Activity", "HeartRate"]:
         master[c] = pd.to_numeric(master[c], errors="coerce")
@@ -106,7 +102,6 @@ def build_master(xlsx_path: str) -> pd.DataFrame:
         master = master[master["Time"] <= float(TIME_MAX)]
 
     return master.reset_index(drop=True)
-
 
 
 def add_predictor_lags(df: pd.DataFrame, group_cols=("Condition", "Subject_ID")) -> pd.DataFrame:
@@ -134,18 +129,21 @@ def rmse(y_true, y_pred) -> float:
     return float(np.sqrt(mean_squared_error(y_true, y_pred)))
 
 
-# LOSO BASELINE + OOS TORPOR RESIDUALS
+def mae(y_true, y_pred) -> float:
+    return float(mean_absolute_error(y_true, y_pred))
+
+
+# LOSO BASELINE + OOS TORPOR RESIDUALS + TORPOR ERROR SCORING
 def run_loso_rf(df_all: pd.DataFrame) -> None:
     df = df_all.copy()
 
-    # sex encode
+
     df["Sex_Encoded"] = df["Sex"].map({"M": 0, "F": 1}).fillna(0).astype(int)
 
     # add predictor lags/deltas
     if USE_LAG_FEATURES:
         df = add_predictor_lags(df)
 
-    # define feature columns
     base_feats = []
     if INCLUDE_TIME:
         base_feats.append("Time")
@@ -157,11 +155,7 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
 
     feature_cols = base_feats + lag_feats
 
-
-    # Training data = Non-torpor
-
     non = df[df["Condition"] == "nontorpor"].copy()
-    # require VO2 + all needed predictors present
     non = non.dropna(subset=["VO2"] + feature_cols).copy()
 
     print(f"Non-torpor rows: {len(non)}  Non-torpor mice: {non['Subject_ID'].nunique()}")
@@ -175,6 +169,9 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
     oos_non_rows = []
     oos_torpor_rows = []
     fold_rmses = []
+
+
+    torpor_metrics_rows = []
 
     for fold_i, (tr, te) in enumerate(logo.split(X_non, y_non, groups=groups), start=1):
         test_mouse = pd.Series(groups[te]).iloc[0]
@@ -226,18 +223,61 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
         oos_torpor_rows.append(tmp_tor)
 
 
+        tor_rmse = rmse(tmp_tor["VO2_obs"].values, tmp_tor["VO2_pred"].values)
+        tor_mae = mae(tmp_tor["VO2_obs"].values, tmp_tor["VO2_pred"].values)
+        torpor_metrics_rows.append({
+            "fold": int(fold_i),
+            "Subject_ID": str(test_mouse),
+            "torpor_n": int(len(tmp_tor)),
+            "torpor_rmse": float(tor_rmse),
+            "torpor_mae": float(tor_mae),
+        })
+        print(f"          | test=Torpor-like|{test_mouse} | RMSE={tor_rmse:.4f}  MAE={tor_mae:.4f}")
+
     oos_non = pd.concat(oos_non_rows, ignore_index=True) if oos_non_rows else pd.DataFrame()
     oos_tor = pd.concat(oos_torpor_rows, ignore_index=True) if oos_torpor_rows else pd.DataFrame()
+    torpor_metrics = pd.DataFrame(torpor_metrics_rows)
 
     non_csv = os.path.join(OUTDIR, "oos_non_torpor_predictions.csv")
     tor_csv = os.path.join(OUTDIR, "oos_torpor_predictions_and_residuals.csv")
+    metrics_csv = os.path.join(OUTDIR, "torpor_oos_metrics_by_mouse.csv")
+    summary_txt = os.path.join(OUTDIR, "metrics_summary.txt")
 
     oos_non.to_csv(non_csv, index=False)
     oos_tor.to_csv(tor_csv, index=False)
+    torpor_metrics.to_csv(metrics_csv, index=False)
+
+
+    overall_tor_rmse = np.nan
+    overall_tor_mae = np.nan
+    if len(oos_tor) > 0:
+        overall_tor_rmse = rmse(oos_tor["VO2_obs"].values, oos_tor["VO2_pred"].values)
+        overall_tor_mae = mae(oos_tor["VO2_obs"].values, oos_tor["VO2_pred"].values)
+
+    with open(summary_txt, "w") as f:
+        f.write("=== Non-torpor LOSO (held-out non-torpor mouse) ===\n")
+        f.write(f"Non-torpor LOSO RMSE mean={np.mean(fold_rmses):.6f}, std={np.std(fold_rmses):.6f}\n\n")
+
+        f.write("=== Torpor-like OOS (held-out mouse, torpor segment) ===\n")
+        if len(torpor_metrics) > 0:
+            f.write(f"Per-mouse torpor RMSE mean={torpor_metrics['torpor_rmse'].mean():.6f}, "
+                    f"std={torpor_metrics['torpor_rmse'].std(ddof=0):.6f}\n")
+            f.write(f"Per-mouse torpor MAE  mean={torpor_metrics['torpor_mae'].mean():.6f}, "
+                    f"std={torpor_metrics['torpor_mae'].std(ddof=0):.6f}\n")
+        if len(oos_tor) > 0:
+            f.write(f"\nPooled OOS torpor RMSE={overall_tor_rmse:.6f}\n")
+            f.write(f"Pooled OOS torpor MAE ={overall_tor_mae:.6f}\n")
+        else:
+            f.write("No OOS torpor rows available.\n")
 
     print(f"\nNon-torpor LOSO RMSE mean={np.mean(fold_rmses):.4f}, std={np.std(fold_rmses):.4f}")
+    if len(oos_tor) > 0:
+        print(f"OOS Torpor pooled: RMSE={overall_tor_rmse:.4f}, MAE={overall_tor_mae:.4f}")
+
     print(f"Saved: {non_csv}")
     print(f"Saved: {tor_csv}")
+    print(f"Saved: {metrics_csv}")
+    print(f"Saved: {summary_txt}")
 
 
     if len(oos_non) > 0:
@@ -255,7 +295,6 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
         plt.close()
         print(f"Saved: {out}")
 
-
     if len(oos_non) > 0 and len(oos_tor) > 0:
         g_non = (oos_non.groupby("Time", as_index=False)
                       .agg(VO2_obs_mean=("VO2_obs", "mean"),
@@ -265,10 +304,8 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
                            VO2_pred_mean=("VO2_pred", "mean")))
 
         plt.figure(figsize=(12, 5))
-        # Non-torpor
         plt.plot(g_non["Time"], g_non["VO2_obs_mean"], label="Non-torpor Actual")
         plt.plot(g_non["Time"], g_non["VO2_pred_mean"], linestyle="--", label="Non-torpor Predicted (baseline)")
-        # Torpor-like
         plt.plot(g_tor["Time"], g_tor["VO2_obs_mean"], label="Torpor-like Actual")
         plt.plot(g_tor["Time"], g_tor["VO2_pred_mean"], linestyle="--", label="Torpor-like Predicted (by baseline)")
         plt.xlabel("Time (min)")
@@ -280,7 +317,6 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
         plt.savefig(out, dpi=300)
         plt.close()
         print(f"Saved: {out}")
-
 
     if len(oos_tor) > 0:
         gt = (oos_tor.groupby("Time", as_index=False)
@@ -306,7 +342,6 @@ def run_loso_rf(df_all: pd.DataFrame) -> None:
         plt.savefig(out, dpi=300)
         plt.close()
         print(f"Saved: {out}")
-
 
 
 if __name__ == "__main__":
