@@ -188,8 +188,6 @@ mae = mean_absolute_error(test_torpor["VO2"], test_torpor["VO2_pred"])
 print(f"\nFeature-Lag Prediction RMSE (No Clipping): {rmse:.4f}")
 print(f"Feature-Lag Prediction MAE  (No Clipping): {mae:.4f}")
 
-# (第6部分的可视化代码不需要改，因为它直接读取 test_torpor["VO2_pred"])
-
 # ==========================================
 # 6. 可视化
 # ==========================================
@@ -202,17 +200,23 @@ mean_tor = test_torpor.groupby("time")[["VO2", "VO2_pred"]].mean().reset_index()
 
 plt.figure(figsize=(10, 6))
 
-# Non-torpor: 蓝色
-plt.plot(mean_non["time"], mean_non["VO2"], 'b-', label="Non-torpor Actual", alpha=0.6)
-plt.plot(mean_non["time"], mean_non["VO2_pred"], 'b--', label="Non-torpor Predicted")
+# 定义色盲友好的颜色 (Okabe-Ito Palette)
+c_non = '#0072B2'
+c_tor = '#D55E00'
 
-# Torpor: 红色
-plt.plot(mean_tor["time"], mean_tor["VO2"], 'r-', label="Torpor Actual", alpha=0.8)
-plt.plot(mean_tor["time"], mean_tor["VO2_pred"], 'r--', label="Torpor Predicted (Feature-Lag)")
+# Non-torpor:
+plt.plot(mean_non["time"], mean_non["VO2"], 'b-', label="Non-torpor (train): observed", alpha=0.6, color=c_non)
+plt.plot(mean_non["time"], mean_non["VO2_pred"], 'b--', label="Non-torpor (train): predicted", color=c_non)
+
+# Torpor:
+plt.plot(mean_tor["time"], mean_tor["VO2"], 'r-', label="Torpor (test): observed", alpha=0.8, color=c_tor)
+plt.plot(mean_tor["time"], mean_tor["VO2_pred"], 'r--', label="Torpor (test): predicted", color=c_tor)
 
 plt.xlabel("Time (min)")
 plt.ylabel("VO2")
 plt.title("Feature-Lag GAM Model")
+plt.ylabel("Mean VO₂ (mL/kg)")
+plt.title("Feature-Lag GAM Model: mean VO₂ over time")
 plt.legend()
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
