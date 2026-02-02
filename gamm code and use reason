@@ -297,6 +297,19 @@ yhat_tor = predict_mixedlm(final_res, X_tor)
 test_torpor = test_torpor.copy()
 test_torpor["VO2_pred"] = yhat_tor
 
+# Hi Morris, Added this section here! Save torpor predictions for statistical validation
+
+out_cols = ["mouse_id", "time", "VO2", "VO2_pred"]
+
+test_torpor[out_cols].rename(
+    columns={"VO2": "VO2_obs"}
+).to_csv(
+    "gamm_oos_torpor_predictions.csv",
+    index=False
+)
+
+print("Saved: gamm_oos_torpor_predictions.csv")
+
 rmse_tor = np.sqrt(mean_squared_error(test_torpor["VO2"], test_torpor["VO2_pred"]))
 mae_tor = mean_absolute_error(test_torpor["VO2"], test_torpor["VO2_pred"])
 print(f"\n[Torpor test] RMSE: {rmse_tor:.4f}")
