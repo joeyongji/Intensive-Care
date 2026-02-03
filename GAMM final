@@ -1,0 +1,339 @@
+# =========================
+# 0) Auto-install pygam if missing
+# =========================
+import sys, subprocess
+
+try:
+    from pygam import LinearGAM, s, f
+except ModuleNotFoundError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "pygam"])
+    from pygam import LinearGAM, s, f
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+
+
+# =========================
+# 1) Config
+# =========================
+# Colab: "/content/Organized data.xlsx"
+PATH = "/content/Organized data.xlsx"
+
+# 用 HR 表示 Heart Rate（不要叫 RQ，避免概念错误）
+SHEETS = {
+    ("torpor", "Tcore"): "Tcore torpor-like",
+    ("non",   "Tcore"): "Tcore nontorpor",
+    ("torpor", "VO2"):  "VO2 torpor-like",
+    ("non",   "VO2"):   "VO2 nontorpor",
+    ("torpor", "Activity"): "activity torpor-like",
+    ("non",   "Activity"): "ativity nontorpor",
+    ("torpor", "HR"): "Heart Rate torpor-like",
+    ("non",   "HR"): "Heart Rate nontorpor",
+}
+
+LAGS = [1, 2, 3]
+USE_DELTA = True
+TIME_RANGE = (1, 119)       # inclusive
+
+# 建议：不要对 torpor 做 clip（否则把 torpor 的极端信号剪没）
+CLIP_IN_FOLDS = True        # fold 内 clip val 到 train range（可保守）
+CLIP_TEST = False           # ✅默认 False：避免把 torpor 特征剪成 non 的样子
+
+LAM_GRID = np.logspace(-3, 3, 9)
+N_SPLINES = 10
+
+OUT_CSV = "gam_condition_featurelag_loso_predictions.csv"
+
+
+# =========================
+# 2) IO helpers
+# =========================
+def read_wide_sheet(sheet_name: str):
+    """
+    Read sheet shaped like:
+      time | mouse1 | mouse2 | ...
+    Gender may be stored in:
+      - first row (cells contain M/F)
+      - OR a row where time is NaN
+    Returns long df [time, mouse_id, value] and gender_map.
+    """
+    df = pd.read_excel(PATH, sheet_name=sheet_name)
+    time_col = df.columns[0]
+
+    first_row = df.iloc[0]
+    if first_row.astype(str).str.contains("M|F", regex=True).any():
+        mouse_cols = [c for c in df.columns[1:]]
+        gender_map = {str(c): str(first_row[c]).strip() for c in mouse_cols}
+        df_num = df.iloc[1:].copy()
+    else:
+        gender_row = df[df[time_col].isna()]
+        if not gender_row.empty:
+            gender_row = gender_row.iloc[0]
+            mouse_cols = [c for c in df.columns[1:]]
+            gender_map = {str(c): str(gender_row[c]).strip() for c in mouse_cols}
+            df_num = df[df[time_col].notna()].copy()
+        else:
+            gender_map = None
+            df_num = df.copy()
+
+    df_num = df_num.rename(columns={time_col: "time"})
+    long = df_num.melt(id_vars=["time"], var_name="mouse_id", value_name="value")
+    long["mouse_id"] = long["mouse_id"].astype(str)
+    return long, gender_map
+
+
+def build_long_dataset():
+    parts = []
+    gender_master = {}
+
+    for (cond, var), sh in SHEETS.items():
+        long, gmap = read_wide_sheet(sh)
+        if gmap:
+            for k, v in gmap.items():
+                if k not in gender_master:
+                    gender_master[k] = v
+        long["condition"] = cond
+        long["var"] = var
+        parts.append(long)
+
+    df_all = pd.concat(parts, ignore_index=True)
+
+    df_wide = (
+        df_all.pivot_table(
+            index=["condition", "time", "mouse_id"],
+            columns="var",
+            values="value",
+            aggfunc="mean"
+        )
+        .reset_index()
+    )
+    df_wide["gender"] = df_wide["mouse_id"].map(gender_master)
+    return df_wide
+
+
+def add_feature_lags(df: pd.DataFrame, base_cols, lags, use_delta=True):
+    """
+    Feature-lag model: lag physiology only (NOT VO2),
+    within (condition, mouse_id).
+    """
+    df = df.sort_values(["condition", "mouse_id", "time"]).copy()
+
+    for col in base_cols:
+        for L in lags:
+            df[f"{col}_lag{L}"] = df.groupby(["condition", "mouse_id"])[col].shift(L)
+        if use_delta:
+            df[f"{col}_delta1"] = df[col] - df.groupby(["condition", "mouse_id"])[col].shift(1)
+
+    need = []
+    for col in base_cols:
+        for L in lags:
+            need.append(f"{col}_lag{L}")
+        if use_delta:
+            need.append(f"{col}_delta1")
+
+    return df.dropna(subset=need).copy()
+
+
+def clip_to_train_range(df_in: pd.DataFrame, train_ref: pd.DataFrame, cols):
+    df_out = df_in.copy()
+    for c in cols:
+        lo, hi = train_ref[c].min(), train_ref[c].max()
+        df_out[c] = df_out[c].clip(lo, hi)
+    return df_out
+
+
+def build_xy(df_in: pd.DataFrame, cont_cols, cat_cols):
+    X = df_in[cont_cols + cat_cols].values
+    y = df_in["VO2"].values
+    return X, y
+
+
+# =========================
+# 3) Model: condition-aware GAM
+# =========================
+def make_condition_gam(n_cont, idx_cond, idx_gender, lam):
+    """
+    Key idea:
+      - Base smooths for each continuous predictor: s(x)
+      - PLUS condition-specific deviation: s(x, by=condition_code)
+        (condition_code is 0/1; this gives torpor a different smooth shape)
+      - Factor for condition intercept shift + gender
+    """
+    # smooth on feature 0
+    terms = s(0, n_splines=N_SPLINES) + s(0, by=idx_cond, n_splines=N_SPLINES)
+
+    for i in range(1, n_cont):
+        terms += s(i, n_splines=N_SPLINES) + s(i, by=idx_cond, n_splines=N_SPLINES)
+
+    # condition intercept shift + gender
+    terms += f(idx_cond) + f(idx_gender)
+
+    return LinearGAM(terms, lam=lam)
+
+
+# =========================
+# 4) Build dataset
+# =========================
+data = build_long_dataset()
+data = data[(data["time"] >= TIME_RANGE[0]) & (data["time"] <= TIME_RANGE[1])].copy()
+
+for c in ["VO2", "Tcore", "Activity", "HR"]:
+    data[c] = pd.to_numeric(data[c], errors="coerce")
+
+df = data.dropna(subset=["VO2", "Tcore", "Activity", "HR", "gender", "mouse_id", "condition"]).copy()
+
+df["gender_code"] = (df["gender"].astype(str).str.upper().str.contains("F", na=False)).astype(int)
+df["cond_code"] = (df["condition"].astype(str).str.lower().str.contains("torpor")).astype(int)
+
+base_phys = ["Tcore", "Activity", "HR"]
+df = add_feature_lags(df, base_phys, LAGS, use_delta=USE_DELTA)
+
+print("Full dataset:", df.shape, " | mice:", df["mouse_id"].nunique())
+
+# predictors: continuous + time (as a smooth too)
+cont_cols = base_phys + [f"{c}_lag{L}" for c in base_phys for L in LAGS]
+if USE_DELTA:
+    cont_cols += [f"{c}_delta1" for c in base_phys]
+cont_cols += ["time"]
+
+# categorical columns (but cond_code is also used as "by" numeric)
+cat_cols = ["cond_code", "gender_code"]
+
+n_cont = len(cont_cols)
+# In X = [cont_cols] + [cond_code, gender_code]
+idx_cond = n_cont + 0
+idx_gender = n_cont + 1
+
+
+# =========================
+# 5) LOSO CV to pick lam (across ALL data)
+# =========================
+logo = LeaveOneGroupOut()
+groups = df["mouse_id"].values
+
+best_lam = None
+best_rmse = np.inf
+cv_results = []
+
+for lam in LAM_GRID:
+    rmses, maes = [], []
+
+    for tr_idx, va_idx in logo.split(df, groups=groups):
+        tr = df.iloc[tr_idx].copy()
+        va = df.iloc[va_idx].copy()
+
+        if CLIP_IN_FOLDS:
+            va = clip_to_train_range(va, tr, cont_cols)
+
+        tr["gender_code"] = tr["gender_code"].astype(int)
+        tr["cond_code"] = tr["cond_code"].astype(int)
+        va["gender_code"] = va["gender_code"].astype(int)
+        va["cond_code"] = va["cond_code"].astype(int)
+
+        X_tr, y_tr = build_xy(tr, cont_cols, cat_cols)
+        X_va, y_va = build_xy(va, cont_cols, cat_cols)
+
+        gam = make_condition_gam(n_cont=n_cont, idx_cond=idx_cond, idx_gender=idx_gender, lam=lam)
+        gam.fit(X_tr, y_tr)
+        yhat = gam.predict(X_va)
+
+        rmses.append(np.sqrt(mean_squared_error(y_va, yhat)))
+        maes.append(mean_absolute_error(y_va, yhat))
+
+    mean_rmse = float(np.mean(rmses))
+    mean_mae = float(np.mean(maes))
+    cv_results.append((lam, mean_rmse, mean_mae))
+    print(f"[LOSO all] lam={lam:.4g} | RMSE={mean_rmse:.4f} | MAE={mean_mae:.4f}")
+
+    if mean_rmse < best_rmse:
+        best_rmse = mean_rmse
+        best_lam = lam
+
+print("\n===== CV Summary (ALL, LOSO) =====")
+for lam, r, a in cv_results:
+    print(f"lam={lam:.4g}  RMSE={r:.4f}  MAE={a:.4f}")
+print(f"✅ Best lam = {best_lam:.4g} (RMSE={best_rmse:.4f})")
+
+
+# =========================
+# 6) Final fit on ALL data, then LOSO predictions saved
+# =========================
+df2 = df.copy()
+df2["gender_code"] = df2["gender_code"].astype(int)
+df2["cond_code"] = df2["cond_code"].astype(int)
+
+# For reporting: generate strict LOSO predictions (each mouse predicted by a model not trained on it)
+preds = []
+for tr_idx, va_idx in logo.split(df2, groups=df2["mouse_id"].values):
+    tr = df2.iloc[tr_idx].copy()
+    va = df2.iloc[va_idx].copy()
+
+    if CLIP_IN_FOLDS:
+        va = clip_to_train_range(va, tr, cont_cols)
+
+    X_tr, y_tr = build_xy(tr, cont_cols, cat_cols)
+    X_va, y_va = build_xy(va, cont_cols, cat_cols)
+
+    gam = make_condition_gam(n_cont=n_cont, idx_cond=idx_cond, idx_gender=idx_gender, lam=best_lam)
+    gam.fit(X_tr, y_tr)
+    va = va.copy()
+    va["VO2_pred"] = gam.predict(X_va)
+    preds.append(va[["mouse_id", "condition", "time", "VO2", "VO2_pred"]])
+
+pred_all = pd.concat(preds, ignore_index=True)
+
+# Optional: one final model trained on all data for deployment-like use
+X_all, y_all = build_xy(df2, cont_cols, cat_cols)
+final_gam = make_condition_gam(n_cont=n_cont, idx_cond=idx_cond, idx_gender=idx_gender, lam=best_lam)
+final_gam.fit(X_all, y_all)
+
+# If you want "test without clipping" on the full set, you can generate predictions too:
+if not CLIP_TEST:
+    df2["VO2_pred_fullfit"] = final_gam.predict(X_all)
+
+# Metrics (LOSO)
+rmse_all = np.sqrt(mean_squared_error(pred_all["VO2"], pred_all["VO2_pred"]))
+mae_all = mean_absolute_error(pred_all["VO2"], pred_all["VO2_pred"])
+
+rmse_non = np.sqrt(mean_squared_error(pred_all[pred_all["condition"]=="non"]["VO2"],
+                                      pred_all[pred_all["condition"]=="non"]["VO2_pred"]))
+rmse_tor = np.sqrt(mean_squared_error(pred_all[pred_all["condition"]=="torpor"]["VO2"],
+                                      pred_all[pred_all["condition"]=="torpor"]["VO2_pred"]))
+
+print("\n===== LOSO Metrics (ALL mice) =====")
+print(f"Overall RMSE: {rmse_all:.4f} | MAE: {mae_all:.4f}")
+print(f"Non RMSE    : {rmse_non:.4f}")
+print(f"Torpor RMSE : {rmse_tor:.4f}")
+
+pred_all.rename(columns={"VO2": "VO2_obs"}).to_csv(OUT_CSV, index=False)
+print(f"Saved: {OUT_CSV}")
+
+
+# =========================
+# 7) Plot mean curves (4 lines) with requested colors/title
+# =========================
+mean_non = pred_all[pred_all["condition"]=="non"].groupby("time")[["VO2","VO2_pred"]].mean().reset_index()
+mean_tor = pred_all[pred_all["condition"]=="torpor"].groupby("time")[["VO2","VO2_pred"]].mean().reset_index()
+
+plt.figure(figsize=(10, 6))
+
+# Non-torpor: blue
+plt.plot(mean_non["time"], mean_non["VO2"], linestyle='-', color='blue', label="Non-torpor Actual", alpha=0.7)
+plt.plot(mean_non["time"], mean_non["VO2_pred"], linestyle='--', color='blue', label="Non-torpor Predicted", alpha=0.9)
+
+# Torpor: orange
+plt.plot(mean_tor["time"], mean_tor["VO2"], linestyle='-', color='orange', label="Torpor Actual", alpha=0.7)
+plt.plot(mean_tor["time"], mean_tor["VO2_pred"], linestyle='--', color='orange', label="Torpor Predicted", alpha=0.9)
+
+plt.xlabel("Time (min)")
+plt.ylabel("VO₂ (Metabolic Rate)")
+plt.title("Feature-Lag GAMM Model: mean VO₂ over time")
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
