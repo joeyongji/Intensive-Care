@@ -11,7 +11,7 @@ from statsmodels.stats.multitest import multipletests
 # =========================
 RF_CSV   = r"rf_dynamic_outputs_v2\oos_torpor_predictions_and_residuals.csv"
 GAM_CSV  = r"gam_outputs\oos_torpor_predictions_and_residuals.csv"
-GAMM_CSV = r"gamm_outputs\oos_torpor_predictions_and_residuals.csv"
+GAMM_CSV = r"gam_condition_featurelag_loso_predictions.csv"
 
 OUTDIR = "statistical_validation_results"
 os.makedirs(OUTDIR, exist_ok=True)
