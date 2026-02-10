@@ -191,6 +191,15 @@ print(f"Feature-Lag Prediction MAE  (No Clipping): {mae:.4f}")
 # ==========================================
 # 6. 可视化
 # ==========================================
+# 设置全局样式
+plt.rcParams.update({
+    'font.size': 12,           # 全局字体大小（影响标题、坐标轴、图例）
+    'axes.labelsize': 14,      # 坐标轴标签字体大小 (xlabel, ylabel)
+    'axes.titlesize': 16,      # 标题字体大小
+    'legend.fontsize': 12,     # 图例字体大小
+    'lines.linewidth': 2.0,    # 线条宽度（全局默认值）
+})
+
 # 给 Train 集也生成预测值
 train["VO2_pred"] = gam.predict(X_train)
 
@@ -205,19 +214,17 @@ c_non = '#0072B2'
 c_tor = '#D55E00'
 
 # Non-torpor:
-plt.plot(mean_non["time"], mean_non["VO2"], 'b-', label="Non-torpor (train): observed", alpha=0.6, color=c_non)
-plt.plot(mean_non["time"], mean_non["VO2_pred"], 'b--', label="Non-torpor (train): predicted", color=c_non)
+plt.plot(mean_non["time"], mean_non["VO2"], 'b-', label="Non-torpor (train): observed", alpha=0.6, color=c_non, linewidth=2.0)
+plt.plot(mean_non["time"], mean_non["VO2_pred"], 'b--', label="Non-torpor (train): predicted", color=c_non, linewidth=2.0)
 
 # Torpor:
-plt.plot(mean_tor["time"], mean_tor["VO2"], 'r-', label="Torpor (test): observed", alpha=0.8, color=c_tor)
-plt.plot(mean_tor["time"], mean_tor["VO2_pred"], 'r--', label="Torpor (test): predicted", color=c_tor)
+plt.plot(mean_tor["time"], mean_tor["VO2"], 'r-', label="Torpor (test): observed", alpha=0.8, color=c_tor, linewidth=2.0)
+plt.plot(mean_tor["time"], mean_tor["VO2_pred"], 'r--', label="Torpor (test): predicted", color=c_tor, linewidth=2.0)
 
-plt.xlabel("Time (min)")
-plt.ylabel("VO2")
-plt.title("Feature-Lag GAM Model")
-plt.ylabel("Mean VO₂ (mL/kg)")
-plt.title("Feature-Lag GAM Model: mean VO₂ over time")
-plt.legend()
+plt.xlabel("Time (min)", fontsize=14)
+plt.ylabel("Mean VO₂ (mL/kg)", fontsize=14)
+plt.title("Feature-Lag GAM Model: mean VO₂ over time", fontsize=16)
+plt.legend(fontsize=12)
 plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
